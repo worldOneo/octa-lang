@@ -48,6 +48,12 @@ pub struct CodeLocation {
   line: usize,
 }
 
+impl CodeLocation {
+  pub fn new(file: String, line: usize) -> CodeLocation {
+    CodeLocation { file, line }
+  }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
   Operator(OpType),
@@ -250,10 +256,10 @@ impl Lexer {
     return Ok(Token::Identifier(identifier));
   }
 
-  pub fn all_tokens(&mut self) -> Vec<Token> {
+  pub fn all_tokens(&mut self) -> Vec<(Token, CodeLocation)> {
     let mut tokens = vec![];
     while let Ok(token) = self.pull_token() {
-      tokens.push(token);
+      tokens.push((token, self.location()));
     }
     tokens
   }
@@ -346,13 +352,50 @@ mod tests {
   #[test]
   fn test_lexer_parse_assignment() {
     let mut lexer = super::Lexer::new("let a = 1", "test");
-    assert_eq!(lexer.pull_token(), Ok(super::Token::Keyword(super::Keyword::Let)));
-    assert_eq!(lexer.pull_token(), Ok(super::Token::Identifier("a".to_string())));
+    assert_eq!(
+      lexer.pull_token(),
+      Ok(super::Token::Keyword(super::Keyword::Let))
+    );
+    assert_eq!(
+      lexer.pull_token(),
+      Ok(super::Token::Identifier("a".to_string()))
+    );
     assert_eq!(
       lexer.pull_token(),
       Ok(super::Token::Operator(super::OpType::Eq))
     );
     assert_eq!(lexer.pull_token(), Ok(super::Token::Integer(1)));
     assert_eq!(lexer.pull_token(), Err(LexerError::EndOfCode));
+  }
+
+  #[test]
+  #[rustfmt::skip]
+  fn test_lexer_all_tokens() {
+    let file = || "test".to_string();
+    let mut lexer = super::Lexer::new(
+      "let first = 1 + 2 * 3\r\nlet second = first\nlet third = 3",
+      "test"
+    );
+    assert_eq!(
+      lexer.all_tokens(),
+      vec![
+        (super::Token::Keyword(super::Keyword::Let), super::CodeLocation::new(file(), 1)),
+        (super::Token::Identifier("first".to_string()), super::CodeLocation::new(file(), 1)),
+        (super::Token::Operator(super::OpType::Eq), super::CodeLocation::new(file(), 1)),
+        (super::Token::Integer(1), super::CodeLocation::new(file(), 1)),
+        (super::Token::Operator(super::OpType::Add), super::CodeLocation::new(file(), 1)),
+        (super::Token::Integer(2), super::CodeLocation::new(file(), 1)),
+        (super::Token::Operator(super::OpType::Mul), super::CodeLocation::new(file(), 1)),
+        (super::Token::Integer(3), super::CodeLocation::new(file(), 1)),
+        (super::Token::Keyword(super::Keyword::Let), super::CodeLocation::new(file(), 2)),
+        (super::Token::Identifier("second".to_string()), super::CodeLocation::new(file(), 2)),
+        (super::Token::Operator(super::OpType::Eq), super::CodeLocation::new(file(), 2)),
+        (super::Token::Identifier("first".to_string()), super::CodeLocation::new(file(), 2)),
+        (super::Token::Keyword(super::Keyword::Let), super::CodeLocation::new(file(), 3)),
+        (super::Token::Identifier("third".to_string()), super::CodeLocation::new(file(), 3)),
+        (super::Token::Operator(super::OpType::Eq), super::CodeLocation::new(file(), 3)),
+        (super::Token::Integer(3), super::CodeLocation::new(file(), 3)),
+      ]
+    )
   }
 }
