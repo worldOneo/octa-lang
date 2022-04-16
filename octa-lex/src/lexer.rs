@@ -60,6 +60,7 @@ pub enum Token {
   Identifier(String),
   Integer(i64),
   Float(f64),
+  String(String),
   Keyword(Keyword),
 }
 
@@ -135,6 +136,7 @@ pub enum LexerError {
   InvalidFloat(CodeLocation),
   InvalidKeyword(CodeLocation),
   InvalidOperator(CodeLocation),
+  InvalidString(CodeLocation),
   EndOfCode,
 }
 
@@ -215,6 +217,24 @@ impl Lexer {
     parse_float(float.as_str())
   }
 
+  fn pull_string(&mut self) -> Result<String, String> {
+    let mut string = String::new();
+    while let Some(c) = self.code.get(0) {
+      if *c == '"' {
+        break;
+      }
+      string.push(*c);
+      self.code.remove(0);
+    }
+    if let Some(c) = self.code.get(0) {
+      if *c == '"' {
+        self.code.remove(0);
+        return Ok(string);
+      }
+    }
+    Err("Unterminated string".to_string())
+  }
+
   pub fn location(&self) -> CodeLocation {
     CodeLocation {
       file: self.file.clone(),
@@ -247,6 +267,13 @@ impl Lexer {
         return Ok(Token::Float(float));
       }
       return Err(LexerError::InvalidInteger(self.location()));
+    }
+
+    if first == '"' {
+      if let Ok(string) = self.pull_string() {
+        return Ok(Token::String(string));
+      }
+      return Err(LexerError::InvalidString(self.location()));
     }
     let identifier = self.pull_identifier(first);
     if let Some(keyword) = as_keyword(identifier.clone()) {
@@ -365,6 +392,28 @@ mod tests {
       Ok(super::Token::Operator(super::OpType::Eq))
     );
     assert_eq!(lexer.pull_token(), Ok(super::Token::Integer(1)));
+    assert_eq!(lexer.pull_token(), Err(LexerError::EndOfCode));
+  }
+
+  #[test]
+  fn test_lexex_parse_string() {
+    let mut lexer = super::Lexer::new("let a = \"hello world\"", "test");
+    assert_eq!(
+      lexer.pull_token(),
+      Ok(super::Token::Keyword(super::Keyword::Let))
+    );
+    assert_eq!(
+      lexer.pull_token(),
+      Ok(super::Token::Identifier("a".to_string()))
+    );
+    assert_eq!(
+      lexer.pull_token(),
+      Ok(super::Token::Operator(super::OpType::Eq))
+    );
+    assert_eq!(
+      lexer.pull_token(),
+      Ok(super::Token::String("hello world".to_string()))
+    );
     assert_eq!(lexer.pull_token(), Err(LexerError::EndOfCode));
   }
 
