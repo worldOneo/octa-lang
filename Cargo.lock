@@ -17,6 +17,9 @@ version = "0.1.0"
 [[package]]
 name = "octa-parse"
 version = "0.1.0"
+dependencies = [
+ "octa-lex",
+]
 
 [[package]]
 name = "octa-vm"
