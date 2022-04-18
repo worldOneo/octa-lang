@@ -1,5 +1,3 @@
-use std::num::ParseFloatError;
-
 pub struct Lexer {
   code: Vec<char>,
   file: String,
@@ -8,16 +6,16 @@ pub struct Lexer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpType {
+  LParen,
+  RParen,
+  LBrace,
+  RBrace,
   LBraket,
   RBraket,
-  LCBraket,
-  RCBraket,
-  LSBraket,
-  RSBraket,
   Question,
   Comma,
-  Not,
   Dot,
+  Not,
   Add,
   Sub,
   Div,
@@ -58,6 +56,7 @@ impl CodeLocation {
 pub enum Token {
   Operator(OpType),
   Identifier(String),
+  Bool(bool),
   Integer(i64),
   Float(f64),
   String(String),
@@ -79,12 +78,12 @@ fn as_keyword(id: String) -> Option<Keyword> {
 
 fn as_operator(c: char) -> Option<OpType> {
   match c {
-    '(' => Some(OpType::LBraket),
-    ')' => Some(OpType::RBraket),
-    '{' => Some(OpType::LCBraket),
-    '}' => Some(OpType::RCBraket),
-    '[' => Some(OpType::LSBraket),
-    ']' => Some(OpType::RSBraket),
+    '(' => Some(OpType::LParen),
+    ')' => Some(OpType::RParen),
+    '{' => Some(OpType::LBrace),
+    '}' => Some(OpType::RBrace),
+    '[' => Some(OpType::LBraket),
+    ']' => Some(OpType::RBraket),
     '+' => Some(OpType::Add),
     '-' => Some(OpType::Sub),
     '/' => Some(OpType::Div),
@@ -280,6 +279,12 @@ impl Lexer {
       return Ok(Token::Keyword(keyword));
     }
 
+    if identifier == "true" {
+      return Ok(Token::Bool(true));
+    } else if identifier == "false" {
+      return Ok(Token::Bool(false));
+    }
+
     return Ok(Token::Identifier(identifier));
   }
 
@@ -396,7 +401,7 @@ mod tests {
   }
 
   #[test]
-  fn test_lexex_parse_string() {
+  fn test_lexer_parse_string() {
     let mut lexer = super::Lexer::new("let a = \"hello world\"", "test");
     assert_eq!(
       lexer.pull_token(),
@@ -413,6 +418,28 @@ mod tests {
     assert_eq!(
       lexer.pull_token(),
       Ok(super::Token::String("hello world".to_string()))
+    );
+    assert_eq!(lexer.pull_token(), Err(LexerError::EndOfCode));
+  }
+
+  #[test]
+  fn test_lexer_parse_bool() {
+    let mut lexer = super::Lexer::new("let a = true", "test");
+    assert_eq!(
+      lexer.pull_token(),
+      Ok(super::Token::Keyword(super::Keyword::Let))
+    );
+    assert_eq!(
+      lexer.pull_token(),
+      Ok(super::Token::Identifier("a".to_string()))
+    );
+    assert_eq!(
+      lexer.pull_token(),
+      Ok(super::Token::Operator(super::OpType::Eq))
+    );
+    assert_eq!(
+      lexer.pull_token(),
+      Ok(super::Token::Bool(true))
     );
     assert_eq!(lexer.pull_token(), Err(LexerError::EndOfCode));
   }
