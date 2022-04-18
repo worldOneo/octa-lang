@@ -1,4 +1,4 @@
-use std::{iter::Map};
+use std::iter::Map;
 
 use octa_lex::lexer::{self, Keyword, OpType};
 
@@ -196,6 +196,10 @@ impl Parser {
         let args = self.parse_list(lexer::Token::Operator(OpType::RParen))?;
         self.parse_extension(AST::ArrayLiteral(args, loc))
       }
+      lexer::Token::Operator(OpType::LBrace) => {
+        let args = self.parse_map()?;
+        self.parse_extension(AST::MapLiteral(args, loc))
+      }
       _ => Err(AstError::UnexpectedToken(token, loc)),
     }
   }
@@ -251,8 +255,10 @@ impl Parser {
           },
           _ => other(),
         };
-        for _ in 0..deq {
-          self.dequeue()?;
+        if let Ok(Some(_)) = res {
+          for _ in 0..deq {
+            self.dequeue()?;
+          }
         }
         return res;
       }
@@ -403,6 +409,36 @@ impl Parser {
         loc,
       ))
     }
+  }
+
+  pub fn parse_map(&mut self) -> Result<Vec<(AST, AST)>, AstError> {
+    let mut map = Vec::new();
+    loop {
+      let key = self.parse_value()?;
+      let (col, loc) = self.dequeue()?;
+      if let lexer::Token::Operator(lexer::OpType::Colon) = col {
+        let value = self.parse_value()?;
+        map.push((key, value));
+        let (comma, loc) = self.dequeue()?;
+        if let lexer::Token::Operator(lexer::OpType::Comma) = comma {
+        } else if let lexer::Token::Operator(lexer::OpType::RBrace) = comma {
+          break;
+        } else {
+          return Err(AstError::TokenExpected(
+            lexer::Token::Operator(lexer::OpType::Comma),
+            Some(comma),
+            loc,
+          ));
+        }
+      } else {
+        return Err(AstError::TokenExpected(
+          lexer::Token::Operator(lexer::OpType::Colon),
+          Some(col),
+          loc,
+        ));
+      }
+    }
+    Ok(map)
   }
 
   pub fn parse(&mut self) -> Result<AST, AstError> {
@@ -673,6 +709,47 @@ mod tests {
           l(),
         )),
         None,
+        l(),
+      ))
+    );
+  }
+
+  #[test]
+  fn test_parse_map() {
+    let l = || CodeLocation::new("base".to_string(), 0);
+    let tokens = vec![
+      (Token::Keyword(Keyword::Let), l()),
+      (Token::Identifier("x".to_string()), l()),
+      (Token::Operator(OpType::Eq), l()),
+      (Token::Operator(OpType::LBrace), l()),
+      (Token::String("a".to_string()), l()),
+      (Token::Operator(OpType::Colon), l()),
+      (Token::Float(1.0), l()),
+      (Token::Operator(OpType::Comma), l()),
+      (Token::String("b".to_string()), l()),
+      (Token::Operator(OpType::Colon), l()),
+      (Token::Float(2.0), l()),
+      (Token::Operator(OpType::RBrace), l()),
+    ];
+    let ast = Parser::new(tokens).parse();
+    assert_eq!(
+      ast,
+      Ok(AST::Assign(
+        AssignType::Let,
+        Box::new(AST::Variable("x".to_string(), l())),
+        Box::new(AST::MapLiteral(
+          vec![
+            (
+              AST::StringLiteral("a".to_string(), l()),
+              AST::FloatLiteral(1.0, l()),
+            ),
+            (
+              AST::StringLiteral("b".to_string(), l()),
+              AST::FloatLiteral(2.0, l()),
+            ),
+          ],
+          l(),
+        )),
         l(),
       ))
     );

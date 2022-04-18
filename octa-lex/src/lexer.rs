@@ -14,6 +14,7 @@ pub enum OpType {
   RBraket,
   Question,
   Comma,
+  Colon,
   Dot,
   Not,
   Add,
@@ -97,6 +98,7 @@ fn as_operator(c: char) -> Option<OpType> {
     '|' => Some(OpType::Or),
     '?' => Some(OpType::Question),
     '!' => Some(OpType::Not),
+    ':' => Some(OpType::Colon),
     _ => None,
   }
 }
