@@ -1,4 +1,4 @@
-use std::iter::Map;
+use std::{iter::Map};
 
 use octa_lex::lexer::{self, Keyword, OpType};
 
@@ -204,45 +204,62 @@ impl Parser {
     self.parse_list(lexer::Token::Operator(OpType::RParen))
   }
 
-  pub fn extend_operator(&self, op: OpType, peek_offset: usize) -> Option<BinOpType> {
-    let next = self.peek_offset(peek_offset);
-    let other = as_bin_op(&op);
+  pub fn possbile_operator(&mut self) -> Result<Option<BinOpType>, AstError> {
+    let (op_tok, loc) = self.peek()?;
+    let op = match op_tok {
+      lexer::Token::Operator(op_tok) => op_tok,
+      _ => return Err(AstError::UnexpectedToken(op_tok, loc)),
+    };
+    let next = self.peek_offset(1);
+    let first_op = as_bin_op(&op);
+    type Res = fn(BinOpType) -> (Result<Option<BinOpType>, AstError>, i32);
+    let some: Res = |op: BinOpType| (Ok(Some(op)), 2);
+    let other = || (Ok(first_op), 1);
+
     if next.is_err() {
-      return other;
+      self.dequeue()?;
+      return Ok(first_op);
     } else {
       let (token, _) = next.unwrap();
       if let lexer::Token::Operator(op2) = token {
-        return match op {
+        let (res, deq) = match op {
           OpType::Gt => match op2 {
-            OpType::Eq => Some(BinOpType::Ge),
-            OpType::Gt => Some(BinOpType::Shr),
-            _ => other,
+            OpType::Eq => some(BinOpType::Ge),
+            OpType::Gt => some(BinOpType::Shr),
+            _ => other(),
           },
           OpType::Lt => match op2 {
-            OpType::Eq => Some(BinOpType::Le),
-            OpType::Lt => Some(BinOpType::Shl),
-            _ => other,
+            OpType::Eq => some(BinOpType::Le),
+            OpType::Lt => some(BinOpType::Shl),
+            _ => other(),
           },
           OpType::Or => match op2 {
-            OpType::Or => Some(BinOpType::Lor),
-            _ => other,
+            OpType::Or => some(BinOpType::Lor),
+            _ => other(),
           },
           OpType::And => match op2 {
-            OpType::And => Some(BinOpType::Land),
-            _ => other,
+            OpType::And => some(BinOpType::Land),
+            _ => other(),
           },
           OpType::Eq => match op2 {
-            OpType::Eq => Some(BinOpType::Eq),
-            _ => other,
+            OpType::Eq => some(BinOpType::Eq),
+            _ => other(),
           },
           OpType::Not => match op2 {
-            OpType::Eq => Some(BinOpType::Ne),
-            _ => other,
+            OpType::Eq => some(BinOpType::Ne),
+            _ => other(),
           },
-          _ => other,
+          _ => other(),
         };
+        for _ in 0..deq {
+          self.dequeue()?;
+        }
+        return res;
       }
-      other
+      if first_op.is_some() {
+        self.dequeue()?;
+      }
+      Ok(first_op)
     }
   }
 
@@ -292,9 +309,7 @@ impl Parser {
           }
         }
         op_type if is_partial_bin_op(&op_type) => {
-          if let Some(op) = self.extend_operator(op_type, 1) {
-            self.dequeue()?;
-            self.dequeue()?;
+          if let Ok(Some(op)) = self.possbile_operator() {
             let rhs = self.parse_value()?;
             if let AST::BinOp(left, right_op, right, _) = rhs.clone() {
               if (op as isize) > (right_op as isize) {
@@ -491,6 +506,39 @@ mod tests {
             l(),
           )),
           l(),
+        )),
+        l(),
+      ))
+    );
+  }
+
+  #[test]
+  fn test_parse_member_access() {
+    let l = || CodeLocation::new("base".to_string(), 0);
+    let tokens = vec![
+      (Token::Keyword(Keyword::Let), l()),
+      (Token::Identifier("x".to_string()), l()),
+      (Token::Operator(OpType::Eq), l()),
+      (Token::Identifier("x".to_string()), l()),
+      (Token::Operator(OpType::Dot), l()),
+      (Token::Identifier("y".to_string()), l()),
+      (Token::Operator(OpType::Dot), l()),
+      (Token::Identifier("z".to_string()), l()),
+    ];
+    let ast = Parser::new(tokens).parse();
+    assert_eq!(
+      ast,
+      Ok(AST::Assign(
+        AssignType::Let,
+        Box::new(AST::Variable("x".to_string(), l())),
+        Box::new(AST::MemberAccess(
+          Box::new(AST::MemberAccess(
+            Box::new(AST::Variable("x".to_string(), l())),
+            "y".to_string(),
+            l(),
+          )),
+          "z".to_string(),
+          l()
         )),
         l(),
       ))
