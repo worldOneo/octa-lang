@@ -27,6 +27,7 @@ pub enum DataType {
   Map(Box<DataType>, Box<DataType>),
   Struct(StructType),
   Function(Box<FunctionDataType>),
+  Generic(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -378,6 +379,14 @@ impl Interpreter {
     loc: lexer::CodeLocation,
   ) -> Result<(), BuildError> {
     let mut parsed_args = Vec::new();
+    if !generic.is_empty() {
+      let mut generic_types = HashMap::new();
+      for (_, arg) in generic.iter().enumerate() {
+        let arg_type = DataType::Generic(arg.clone());
+        generic_types.insert(arg.clone(), arg_type);
+      }
+      self.data_types.push(generic_types);
+    }
     for (lhs, rhs) in args {
       parsed_args.push(self.resolve_parameter_type(&lhs, &rhs)?);
     }
@@ -407,6 +416,9 @@ impl Interpreter {
           ));
         }
       }
+    }
+    if !generic.is_empty() {
+      self.data_types.pop();
     }
     self.data_types[0].insert(
       name.clone(),
@@ -453,6 +465,27 @@ mod tests {
       ret: DataType::String,
       is_generic: false,
       generic_types: vec![],
+    }))));
+  }
+
+  #[test]
+  #[rustfmt::skip]
+  fn test_generic_fn() {
+    let l = || lexer::CodeLocation::new("".to_string(), 0);
+    let v = |s: &str| AST::Variable(s.to_string(), l());
+    let ast = AST::Block(vec![
+      AST::FunctionDefinition("e".to_string(), vec!["T".to_string()], vec![(v("a"), v("T"))],
+                Box::new(v("T")), Box::new(AST::Block(vec![], l())), l())
+    ], l());
+
+    let mut interpreter = Interpreter::new(ast);
+    interpreter.build().unwrap();
+    assert_eq!(interpreter.data_types[0].get("e"), Some(&DataType::Function(Box::new(FunctionDataType {
+      name: "e".to_string(),
+      args: vec![DataType::Generic("T".to_string())],
+      ret: DataType::Generic("T".to_string()),
+      is_generic: true,
+      generic_types: vec!["T".to_string()],
     }))));
   }
 }
