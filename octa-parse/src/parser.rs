@@ -1,38 +1,10 @@
-use std::iter::Map;
-
 use octa_lex::lexer::{self, Keyword, OpType};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssignType {
   Let,
   Const,
-}
-
-pub struct StructField {
-  pub name: String,
-  pub ty: DataType,
-}
-
-pub struct StructType {
-  pub name: String,
-  pub fields: Map<String, StructField>,
-}
-
-pub struct FunctionDataType {
-  pub name: String,
-  pub args: Vec<DataType>,
-  pub ret: DataType,
-}
-
-pub enum DataType {
-  Int,
-  Float,
-  Bool,
-  String,
-  Array(Box<DataType>),
-  Map(Box<DataType>, Box<DataType>),
-  Struct(Box<StructType>),
-  Function(Box<FunctionDataType>),
+  Type,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,6 +29,15 @@ pub enum BinOpType {
   Shr,
 }
 
+impl BinOpType {
+  pub fn is_comparison(&self) -> bool {
+    match self {
+      BinOpType::Eq | BinOpType::Ne | BinOpType::Lt | BinOpType::Gt | BinOpType::Le | BinOpType::Ge => true,
+      _ => false,
+    }
+  }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnOpType {
   Neg,
@@ -65,8 +46,10 @@ pub enum UnOpType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AST {
+  None(lexer::CodeLocation),
   Block(Vec<AST>, lexer::CodeLocation),
-  Assign(AssignType, Box<AST>, Box<AST>, lexer::CodeLocation),
+  Initialize(AssignType, Box<AST>, Box<AST>, lexer::CodeLocation),
+  Assign(Box<AST>, Box<AST>, lexer::CodeLocation),
   BinOp(Box<AST>, BinOpType, Box<AST>, lexer::CodeLocation),
   UnOp(UnOpType, Box<AST>, lexer::CodeLocation),
   Call(Box<AST>, Vec<AST>, lexer::CodeLocation),
@@ -78,17 +61,102 @@ pub enum AST {
   ArrayLiteral(Vec<AST>, lexer::CodeLocation),
   MapLiteral(Vec<(AST, AST)>, lexer::CodeLocation),
   StructLiteral(String, Vec<AST>, lexer::CodeLocation),
-  StructDefinition(String, Vec<(String, String)>, lexer::CodeLocation),
+  StructDefinition(String, Vec<String>, Vec<(String, AST)>, lexer::CodeLocation),
   FunctionDefinition(
     String,
-    Vec<(String, String)>,
-    String,
+    Vec<String>,
+    Vec<(AST, AST)>,
+    Box<AST>,
     Box<AST>,
     lexer::CodeLocation,
   ),
   MemberAccess(Box<AST>, String, lexer::CodeLocation),
   IndexAccess(Box<AST>, Box<AST>, lexer::CodeLocation),
   If(Box<AST>, Box<AST>, Option<Box<AST>>, lexer::CodeLocation),
+  Return(Option<Box<AST>>, lexer::CodeLocation),
+  GenericIdentifier(String, Vec<String>, lexer::CodeLocation), // Func[asd,asd,asd]
+}
+
+impl AST {
+  pub fn location(&self) -> lexer::CodeLocation {
+    match self {
+      AST::None(loc) => loc,
+      AST::Block(.., loc) => loc,
+      AST::Initialize(.., loc) => loc,
+      AST::Assign(.., loc) => loc,
+      AST::BinOp(.., loc) => loc,
+      AST::UnOp(.., loc) => loc,
+      AST::Call(.., loc) => loc,
+      AST::Variable(.., loc) => loc,
+      AST::IntLiteral(.., loc) => loc,
+      AST::FloatLiteral(.., loc) => loc,
+      AST::StringLiteral(.., loc) => loc,
+      AST::BoolLiteral(.., loc) => loc,
+      AST::ArrayLiteral(.., loc) => loc,
+      AST::MapLiteral(.., loc) => loc,
+      AST::StructLiteral(.., loc) => loc,
+      AST::StructDefinition(.., loc) => loc,
+      AST::FunctionDefinition(.., loc) => loc,
+      AST::MemberAccess(.., loc) => loc,
+      AST::IndexAccess(.., loc) => loc,
+      AST::If(.., loc) => loc,
+      AST::Return(.., loc) => loc,
+      AST::GenericIdentifier(.., loc) => loc,
+    }
+    .clone()
+  }
+
+  pub fn subtrees(&self) -> Vec<&AST> {
+    match self {
+      AST::None(_) => vec![],
+      AST::Block(subtrees, _) => subtrees.iter().collect(),
+      AST::Initialize(_, lhs, rhs, _) => vec![lhs, rhs],
+      AST::Assign(lhs, rhs, _) => vec![lhs, rhs],
+      AST::BinOp(lhs, _, rhs, _) => vec![lhs, rhs],
+      AST::UnOp(_, operand, _) => vec![operand],
+      AST::Call(callee, args, _) => vec![callee.as_ref()]
+        .into_iter()
+        .chain(args.iter())
+        .collect(),
+      AST::Variable(_, _) => vec![],
+      AST::IntLiteral(_, _) => vec![],
+      AST::FloatLiteral(_, _) => vec![],
+      AST::StringLiteral(_, _) => vec![],
+      AST::BoolLiteral(_, _) => vec![],
+      AST::ArrayLiteral(elements, _) => elements.iter().collect::<Vec<_>>(),
+      AST::MapLiteral(pairs, _) => pairs
+        .iter()
+        .map(|(a, _)| a)
+        .chain(pairs.iter().map(|(_, b)| b))
+        .collect::<Vec<_>>(),
+      AST::StructLiteral(_, elements, _) => elements.iter().collect::<Vec<_>>(),
+      AST::StructDefinition(_, _, elements, _) => elements.iter().map(|(_, b)| b).collect::<Vec<_>>(),
+      AST::FunctionDefinition(_, _, _, _, body, _) => vec![body],
+      AST::MemberAccess(obj, _, _) => vec![obj],
+      AST::IndexAccess(obj, index, _) => vec![obj, index],
+      AST::If(cond, then, els, _) => {
+        if let Some(els) = els {
+          vec![cond, then, els]
+        } else {
+          vec![cond, then]
+        }
+      }
+      AST::Return(Some(expr), _) => vec![expr],
+      _ => vec![],
+    }
+  }
+
+  pub fn is_pattern(&self) -> bool {
+    match self {
+      AST::IntLiteral(..)
+      | AST::FloatLiteral(..)
+      | AST::BoolLiteral(..)
+      | AST::MapLiteral(..)
+      | AST::ArrayLiteral(..)
+      | AST::StringLiteral(..) => true,
+      _ => false,
+    }
+  }
 }
 
 pub struct Parser {
@@ -100,6 +168,7 @@ pub struct Parser {
 pub enum AstError {
   UnexpectedToken(lexer::Token, lexer::CodeLocation),
   TokenExpected(lexer::Token, Option<lexer::Token>, lexer::CodeLocation),
+  IdentifierExpected(lexer::CodeLocation),
   AstEnd,
 }
 
@@ -303,14 +372,15 @@ impl Parser {
         OpType::LBraket => {
           self.dequeue()?;
           let arg = self.parse_value()?;
-          if let lexer::Token::Operator(OpType::RBraket) = self.dequeue()?.0 {
+          let (token, rloc) = self.dequeue()?;
+          if let lexer::Token::Operator(OpType::RBraket) = token {
             let ast = AST::IndexAccess(Box::new(ast), Box::new(arg), loc);
             self.parse_extension(ast)
           } else {
             Err(AstError::TokenExpected(
               lexer::Token::Operator(OpType::RBraket),
               Some(token),
-              loc,
+              rloc,
             ))
           }
         }
@@ -327,6 +397,10 @@ impl Parser {
             let ast = AST::BinOp(Box::new(ast), op, Box::new(rhs), loc);
             self.parse_extension(ast)
           } else {
+            if op_type == OpType::Eq {
+              let rhs = self.parse_value()?;
+              return Ok(AST::Assign(Box::new(ast), Box::new(rhs), loc));
+            }
             Ok(ast)
           }
         }
@@ -341,10 +415,11 @@ impl Parser {
     let eq = self.dequeue()?;
     if let lexer::Token::Operator(lexer::OpType::Eq) = eq.0 {
       let right_hand = self.parse_value()?;
-      Ok(AST::Assign(
+      Ok(AST::Initialize(
         match keyword {
           lexer::Keyword::Let => AssignType::Let,
           lexer::Keyword::Const => AssignType::Const,
+          lexer::Keyword::Type => AssignType::Type,
           _ => return Err(AstError::UnexpectedToken(eq.0, eq.1)),
         },
         Box::new(left_hand),
@@ -441,6 +516,17 @@ impl Parser {
     Ok(map)
   }
 
+  pub fn parse_return(&mut self) -> Result<AST, AstError> {
+    let (token, loc) = self.peek()?;
+    if let lexer::Token::Operator(OpType::Semicolon) = token {
+      self.dequeue()?;
+      Ok(AST::Return(None, loc))
+    } else {
+      let ast = self.parse_value()?;
+      Ok(AST::Return(Some(Box::new(ast)), loc))
+    }
+  }
+
   pub fn parse(&mut self) -> Result<AST, AstError> {
     let (token, loc) = self.dequeue()?;
     if let lexer::Token::Operator(OpType::LBrace) = token {
@@ -450,7 +536,11 @@ impl Parser {
       lexer::Token::Keyword(keyword) => match keyword {
         Keyword::Const | Keyword::Let => self.parse_initialization(keyword.clone()),
         Keyword::If => self.parse_if(),
-        _ => Err(AstError::UnexpectedToken(token, loc)),
+        Keyword::Return => self.parse_return(),
+        _ => match self.parse_value() {
+          Ok(ast) => self.parse_extension(ast),
+          Err(e) => Err(e),
+        },
       },
       _ => return Err(AstError::UnexpectedToken(token.clone(), loc.clone())),
     }
@@ -499,6 +589,199 @@ impl Parser {
       lexer::CodeLocation::new("base".to_string(), 0),
     ))
   }
+
+  fn parse_type(&mut self) -> Result<AST, AstError> {
+    let (token, loc) = self.dequeue()?;
+    match &token {
+      lexer::Token::Identifier(identifier) => {
+        let identifier = identifier.clone();
+        let ident = match identifier.clone().as_str() {
+          "int" | "bool" | "string" | "float" => AST::Variable(identifier.clone(), loc.clone()),
+          "none" => AST::None(loc.clone()),
+          _ => return Err(AstError::UnexpectedToken(token, loc)),
+        };
+        let (token, loc) = self.peek()?;
+        if let lexer::Token::Operator(OpType::LBraket) = token {
+          let generics = self.parse_identifier_list(lexer::Token::Operator(OpType::RBraket))?;
+          return Ok(AST::GenericIdentifier(identifier, generics, loc));
+        }
+        return Ok(ident);
+      }
+      _ => Err(AstError::IdentifierExpected(loc.clone())),
+    }
+  }
+
+  // Parses a function in the style of
+  // fn foo {}
+  //
+  // fn foo(a: int, b: int) {}
+  //
+  // fn foo(a: int, b: int): int {}
+  //
+  // fn foo[T,V](a: T): V {}
+  //
+  // fn Type foo[T, V](a: T): V {}
+  pub fn parse_function(&mut self, fn_loc: lexer::CodeLocation) -> Result<AST, AstError> {
+    let (token, loc) = self.dequeue()?;
+    if let lexer::Token::Identifier(name) = token {
+      let (token, loc) = self.dequeue()?;
+      match token {
+        lexer::Token::Operator(OpType::LBrace) => {
+          let body = self.parse_block(loc.clone())?;
+          return Ok(AST::FunctionDefinition(
+            name,
+            vec![],
+            vec![],
+            Box::new(AST::None(fn_loc.clone())),
+            Box::new(body),
+            fn_loc,
+          ));
+        }
+        lexer::Token::Operator(OpType::LBraket) => {
+          let generics = self.parse_identifier_list(lexer::Token::Operator(OpType::RBraket))?;
+          let (token, loc) = self.dequeue()?;
+          if let lexer::Token::Operator(OpType::LParen) = token {
+            let params = self.parse_function_params()?;
+            let (token, loc) = self.dequeue()?;
+            if let lexer::Token::Operator(OpType::Colon) = token {
+              let return_type = self.parse_type()?;
+              return Ok(AST::FunctionDefinition(
+                name,
+                generics,
+                params,
+                Box::new(return_type),
+                Box::new(self.parse_full_body(loc.clone())?),
+                loc,
+              ));
+            } else {
+              return Ok(AST::FunctionDefinition(
+                name,
+                generics,
+                params,
+                Box::new(AST::None(fn_loc.clone())),
+                Box::new(self.parse_full_body(loc.clone())?),
+                loc,
+              ));
+            }
+          } else {
+            return Err(AstError::TokenExpected(
+              lexer::Token::Operator(OpType::LParen),
+              Some(token),
+              loc,
+            ));
+          }
+        }
+        lexer::Token::Operator(OpType::LParen) => {
+          let params = self.parse_function_params()?;
+          let (token, loc) = self.dequeue()?;
+          if let lexer::Token::Operator(OpType::Colon) = token {
+            let return_type = self.parse()?;
+            return Ok(AST::FunctionDefinition(
+              name,
+              vec![],
+              params,
+              Box::new(return_type),
+              Box::new(self.parse_full_body(loc.clone())?),
+              loc,
+            ));
+          } else {
+            return Ok(AST::FunctionDefinition(
+              name,
+              vec![],
+              params,
+              Box::new(AST::None(fn_loc.clone())),
+              Box::new(self.parse_full_body(loc.clone())?),
+              loc,
+            ));
+          }
+        }
+        _ => {
+          return Err(AstError::TokenExpected(
+            lexer::Token::Operator(OpType::LBrace),
+            Some(token),
+            loc,
+          ))
+        }
+      }
+    } else {
+      return Err(AstError::IdentifierExpected(loc));
+    }
+  }
+
+  pub fn parse_function_params(&mut self) -> Result<Vec<(AST, AST)>, AstError> {
+    let mut params = Vec::new();
+    loop {
+      let (token, _) = self.dequeue()?;
+      if let lexer::Token::Operator(OpType::RParen) = token {
+        break;
+      }
+      let name = self.parse()?;
+      let (mut token, mut loc) = self.dequeue()?;
+      if let lexer::Token::Operator(OpType::Colon) = token {
+        (token, loc) = self.dequeue()?;
+        let ty = self.parse_type()?;
+        params.push((name, ty));
+      } else {
+        params.push((name, AST::None(loc.clone())));
+      }
+      if let lexer::Token::Operator(OpType::Comma) = token {
+      } else if let lexer::Token::Operator(OpType::RParen) = token {
+        break;
+      } else {
+        return Err(AstError::TokenExpected(
+          lexer::Token::Operator(OpType::Comma),
+          Some(token),
+          loc,
+        ));
+      }
+    }
+    Ok(params)
+  }
+
+  pub fn parse_identifier_list(&mut self, end: lexer::Token) -> Result<Vec<String>, AstError> {
+    let mut res = vec![];
+    loop {
+      let (token, loc) = self.dequeue()?;
+      if token == end {
+        break;
+      }
+      if let lexer::Token::Identifier(name) = token {
+        res.push(name);
+        let (token, loc) = self.dequeue()?;
+        if let lexer::Token::Operator(OpType::Comma) = token {
+        } else if token == end {
+          break;
+        } else {
+          return Err(AstError::TokenExpected(
+            lexer::Token::Operator(OpType::Comma),
+            Some(token),
+            loc,
+          ));
+        }
+      } else {
+        return Err(AstError::TokenExpected(
+          lexer::Token::Identifier(String::new()),
+          Some(token),
+          loc,
+        ));
+      }
+    }
+    Ok(res)
+  }
+
+  fn parse_full_body(&mut self, loc: lexer::CodeLocation) -> Result<AST, AstError> {
+    let (token, loc) = self.dequeue()?;
+    if let lexer::Token::Operator(OpType::LBrace) = token {
+      let body = self.parse_block(loc.clone())?;
+      return Ok(body);
+    } else {
+      return Err(AstError::TokenExpected(
+        lexer::Token::Operator(OpType::LBrace),
+        Some(token),
+        loc,
+      ));
+    }
+  }
 }
 
 pub fn parse(tokens: Vec<(lexer::Token, lexer::CodeLocation)>) -> Result<AST, AstError> {
@@ -529,7 +812,7 @@ mod tests {
     let ast = Parser::new(tokens).parse();
     assert_eq!(
       ast,
-      Ok(AST::Assign(
+      Ok(AST::Initialize(
         AssignType::Let,
         Box::new(AST::Variable("x".to_string(), l())),
         Box::new(AST::BinOp(
@@ -564,7 +847,7 @@ mod tests {
     let ast = Parser::new(tokens).parse();
     assert_eq!(
       ast,
-      Ok(AST::Assign(
+      Ok(AST::Initialize(
         AssignType::Let,
         Box::new(AST::Variable("x".to_string(), l())),
         Box::new(AST::MemberAccess(
@@ -631,7 +914,7 @@ mod tests {
           l(),
         )),
         Box::new(AST::Block(
-          vec![AST::Assign(
+          vec![AST::Initialize(
             AssignType::Let,
             Box::new(AST::Variable("x".to_string(), l())),
             Box::new(AST::FloatLiteral(3.0, l())),
@@ -647,7 +930,7 @@ mod tests {
             l(),
           )),
           Box::new(AST::Block(
-            vec![AST::Assign(
+            vec![AST::Initialize(
               AssignType::Let,
               Box::new(AST::Variable("x".to_string(), l())),
               Box::new(AST::FloatLiteral(3.0, l())),
@@ -656,7 +939,7 @@ mod tests {
             l(),
           )),
           Some(Box::new(AST::Block(
-            vec![AST::Assign(
+            vec![AST::Initialize(
               AssignType::Let,
               Box::new(AST::Variable("x".to_string(), l())),
               Box::new(AST::FloatLiteral(3.0, l())),
@@ -700,7 +983,7 @@ mod tests {
           l(),
         )),
         Box::new(AST::Block(
-          vec![AST::Assign(
+          vec![AST::Initialize(
             AssignType::Let,
             Box::new(AST::Variable("x".to_string(), l())),
             Box::new(AST::FloatLiteral(3.0, l())),
@@ -734,7 +1017,7 @@ mod tests {
     let ast = Parser::new(tokens).parse();
     assert_eq!(
       ast,
-      Ok(AST::Assign(
+      Ok(AST::Initialize(
         AssignType::Let,
         Box::new(AST::Variable("x".to_string(), l())),
         Box::new(AST::MapLiteral(

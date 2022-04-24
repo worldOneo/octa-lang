@@ -5,6 +5,10 @@ version = 3
 [[package]]
 name = "octa-build"
 version = "0.1.0"
+dependencies = [
+ "octa-lex",
+ "octa-parse",
+]
 
 [[package]]
 name = "octa-lang"

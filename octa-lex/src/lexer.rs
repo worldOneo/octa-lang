@@ -15,6 +15,7 @@ pub enum OpType {
   Question,
   Comma,
   Colon,
+  Semicolon,
   Dot,
   Not,
   Add,
@@ -39,6 +40,8 @@ pub enum Keyword {
   Struct,
   Let,
   Const,
+  Type,
+  Return,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +76,8 @@ fn as_keyword(id: String) -> Option<Keyword> {
     "struct" => Some(Keyword::Struct),
     "let" => Some(Keyword::Let),
     "const" => Some(Keyword::Const),
+    "return" => Some(Keyword::Return),
+    "type" => Some(Keyword::Type),
     _ => None,
   }
 }
@@ -99,6 +104,7 @@ fn as_operator(c: char) -> Option<OpType> {
     '?' => Some(OpType::Question),
     '!' => Some(OpType::Not),
     ':' => Some(OpType::Colon),
+    ',' => Some(OpType::Comma),
     _ => None,
   }
 }
