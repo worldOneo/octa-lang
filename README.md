@@ -4,13 +4,13 @@ The Octa programming language
 
 # Goals
 
-- Lexer
-- Parser
-- Builder
-  - Pattern Matching
-  - Types / Type Checking
-  - Atoms
-- VM
-  - GC
-  - Concurrency
-  - Std Mutability
+- [x] Lexer
+- [x] Parser
+- [ ] Builder
+  - [ ] Pattern Matching
+  - [ ] Types / Type Checking
+  - [ ] Atoms
+- [ ] VM
+  - [ ] GC
+  - [ ] Concurrency
+  - [ ] Std Mutability
