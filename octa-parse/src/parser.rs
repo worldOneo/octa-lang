@@ -32,7 +32,12 @@ pub enum BinOpType {
 impl BinOpType {
   pub fn is_comparison(&self) -> bool {
     match self {
-      BinOpType::Eq | BinOpType::Ne | BinOpType::Lt | BinOpType::Gt | BinOpType::Le | BinOpType::Ge => true,
+      BinOpType::Eq
+      | BinOpType::Ne
+      | BinOpType::Lt
+      | BinOpType::Gt
+      | BinOpType::Le
+      | BinOpType::Ge => true,
       _ => false,
     }
   }
@@ -74,7 +79,7 @@ pub enum AST {
   IndexAccess(Box<AST>, Box<AST>, lexer::CodeLocation),
   If(Box<AST>, Box<AST>, Option<Box<AST>>, lexer::CodeLocation),
   Return(Option<Box<AST>>, lexer::CodeLocation),
-  GenericIdentifier(String, Vec<String>, lexer::CodeLocation), // Func[asd,asd,asd]
+  GenericIdentifier(String, Vec<AST>, lexer::CodeLocation), // Func[asd,asd,asd]
 }
 
 impl AST {
@@ -130,7 +135,9 @@ impl AST {
         .chain(pairs.iter().map(|(_, b)| b))
         .collect::<Vec<_>>(),
       AST::StructLiteral(_, elements, _) => elements.iter().collect::<Vec<_>>(),
-      AST::StructDefinition(_, _, elements, _) => elements.iter().map(|(_, b)| b).collect::<Vec<_>>(),
+      AST::StructDefinition(_, _, elements, _) => {
+        elements.iter().map(|(_, b)| b).collect::<Vec<_>>()
+      }
       AST::FunctionDefinition(_, _, _, _, body, _) => vec![body],
       AST::MemberAccess(obj, _, _) => vec![obj],
       AST::IndexAccess(obj, index, _) => vec![obj, index],
@@ -602,13 +609,36 @@ impl Parser {
         };
         let (token, loc) = self.peek()?;
         if let lexer::Token::Operator(OpType::LBraket) = token {
-          let generics = self.parse_identifier_list(lexer::Token::Operator(OpType::RBraket))?;
-          return Ok(AST::GenericIdentifier(identifier, generics, loc));
+          let types = self.parse_type_list()?;
+          return Ok(AST::GenericIdentifier(identifier, types, loc));
         }
         return Ok(ident);
       }
       _ => Err(AstError::IdentifierExpected(loc.clone())),
     }
+  }
+
+  fn parse_type_list(&mut self) -> Result<Vec<AST>, AstError> {
+    let mut types = Vec::new();
+    loop {
+      let (token, loc) = self.dequeue()?;
+      if let lexer::Token::Operator(OpType::RBraket) = token {
+        break;
+      }
+      types.push(self.parse_type()?);
+      let (token, loc) = self.dequeue()?;
+      if let lexer::Token::Operator(OpType::Comma) = token {
+      } else if let lexer::Token::Operator(OpType::RBraket) = token {
+        break;
+      } else {
+        return Err(AstError::TokenExpected(
+          lexer::Token::Operator(OpType::Comma),
+          Some(token),
+          loc,
+        ));
+      }
+    }
+    Ok(types)
   }
 
   // Parses a function in the style of

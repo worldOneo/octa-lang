@@ -1,7 +1,7 @@
-use std::{collections::HashMap, num::IntErrorKind};
+use std::{collections::HashMap, vec};
 
 use octa_lex::lexer;
-use octa_parse::parser::{AssignType, AstError, BinOpType, UnOpType, AST};
+use octa_parse::parser::{AssignType, BinOpType, UnOpType, AST};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructField {
@@ -28,6 +28,7 @@ pub enum DataType {
   Struct(StructType),
   Function(Box<FunctionDataType>),
   Generic(String),
+  GenericResolved(HashMap<String, DataType>, Box<DataType>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +129,7 @@ pub enum BuildError {
   ParameterLenMismatch(usize, usize, lexer::CodeLocation),
   InvalidCall(lexer::CodeLocation),
   TypeNotInferable(lexer::CodeLocation),
+  GenericTypeMismatch(lexer::CodeLocation),
   TopLevelOperationExpected(lexer::CodeLocation),
   TopLevelBlockExpected(lexer::CodeLocation),
 }
@@ -282,6 +284,37 @@ impl Interpreter {
           second.clone(),
           loc.clone(),
         ))
+      }
+      AST::GenericIdentifier(ty, resolved, loc) => {
+        if let Some(ty) = self.type_by_name(ty) {
+          let mut args_ty = vec![];
+          for ty in resolved {
+            args_ty.push(self.resolve_type_def(ty)?);
+          }
+          let mut resolved_ty = HashMap::new();
+          match ty.clone() {
+            DataType::Function(func) => {
+              if func.generic_types.len() != args_ty.len() {
+                return Err(BuildError::GenericTypeMismatch(loc.clone()));
+              }
+              for (i, ty) in func.generic_types.iter().enumerate() {
+                resolved_ty.insert(ty.clone(), args_ty[i].clone());
+              }
+              return Ok(DataType::GenericResolved(resolved_ty, Box::new(ty.clone())));
+            }
+            DataType::Struct(stru) => {
+              if stru.generic_types.len() != args_ty.len() {
+                return Err(BuildError::GenericTypeMismatch(loc.clone()));
+              }
+              for (i, ty) in stru.generic_types.iter().enumerate() {
+                resolved_ty.insert(ty.clone(), args_ty[i].clone());
+              }
+              return Ok(DataType::GenericResolved(resolved_ty, Box::new(ty.clone())));
+            }
+            _ => {}
+          };
+        }
+        Err(BuildError::InvalidType(loc.clone()))
       }
       AST::IntLiteral(_, _) => Ok(DataType::Int),
       AST::FloatLiteral(_, _) => Ok(DataType::Float),
@@ -443,6 +476,13 @@ mod tests {
   fn test_types() {
     let l = || lexer::CodeLocation::new("".to_string(), 0);
     let v = |s: &str| AST::Variable(s.to_string(), l());
+    /*
+     type i = int
+     type f = float
+     type b = bool
+     type s = string
+     fn e(a: int, {a: 1}): string{}
+    */
     let ast = AST::Block(vec![
       AST::Initialize(AssignType::Type,  Box::new(v("a")), Box::new(v("int")), l()),
       AST::Initialize(AssignType::Type, Box::new(v("b")), Box::new(v("bool")), l()),
@@ -473,6 +513,10 @@ mod tests {
   fn test_generic_fn() {
     let l = || lexer::CodeLocation::new("".to_string(), 0);
     let v = |s: &str| AST::Variable(s.to_string(), l());
+    /*
+     fn e[T](a: T): T {
+     }
+    */
     let ast = AST::Block(vec![
       AST::FunctionDefinition("e".to_string(), vec!["T".to_string()], vec![(v("a"), v("T"))],
                 Box::new(v("T")), Box::new(AST::Block(vec![], l())), l())
@@ -487,5 +531,61 @@ mod tests {
       is_generic: true,
       generic_types: vec!["T".to_string()],
     }))));
+  }
+
+  #[test]
+  fn test_generic_resolve() {
+    let l = || lexer::CodeLocation::new("".to_string(), 0);
+    let v = |s: &str| AST::Variable(s.to_string(), l());
+    /*
+    fn e[T](a: T): T {
+    }
+    type i = e[int]
+    */
+    let ast = AST::Block(
+      vec![
+        AST::FunctionDefinition(
+          "e".to_string(),
+          vec!["T".to_string()],
+          vec![(v("a"), v("T"))],
+          Box::new(v("T")),
+          Box::new(AST::Block(vec![], l())),
+          l(),
+        ),
+        AST::Initialize(
+          AssignType::Type,
+          Box::new(v("i")),
+          Box::new(AST::GenericIdentifier("e".to_string(), vec![v("int")], l())),
+          l(),
+        ),
+      ],
+      l(),
+    );
+
+    let mut interpreter = Interpreter::new(ast);
+    interpreter.build().unwrap();
+    assert_eq!(
+      interpreter.data_types[0].get("e"),
+      Some(&DataType::Function(Box::new(FunctionDataType {
+        name: "e".to_string(),
+        args: vec![DataType::Generic("T".to_string())],
+        ret: DataType::Generic("T".to_string()),
+        is_generic: true,
+        generic_types: vec!["T".to_string()],
+      })))
+    );
+    assert_eq!(
+      interpreter.data_types[0].get("i"),
+      Some(&DataType::GenericResolved(
+        [("T".to_string(), DataType::Int)].iter().cloned().collect(),
+        Box::new(DataType::Function(Box::new(FunctionDataType {
+          name: "e".to_string(),
+          args: vec![DataType::Generic("T".to_string())],
+          ret: DataType::Generic("T".to_string()),
+          generic_types: vec!["T".to_string()],
+          is_generic: true
+        })))
+      ))
+    );
   }
 }
