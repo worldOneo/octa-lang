@@ -390,11 +390,11 @@ impl Parser {
               rloc,
             ))
           }
-        },
+        }
         OpType::Colon => {
-          self.dequeue()?;
-          let (token, loc) = self.peek()?;
+          let (token, loc) = self.peek_offset(1)?;
           if let lexer::Token::Operator(OpType::LBraket) = token {
+            self.dequeue()?;
             self.dequeue()?;
             let args = self.parse_type_list()?;
             return self.parse_extension(AST::GenericIdentifier(Box::new(ast), args, loc));
@@ -545,21 +545,26 @@ impl Parser {
   }
 
   pub fn parse(&mut self) -> Result<AST, AstError> {
-    let (token, loc) = self.dequeue()?;
+    let (token, loc) = self.peek()?;
     if let lexer::Token::Operator(OpType::LBrace) = token {
+      self.dequeue()?;
       return self.parse_block(loc);
     }
     match token.clone() {
-      lexer::Token::Keyword(keyword) => match keyword {
-        Keyword::Const | Keyword::Let => self.parse_initialization(keyword.clone()),
-        Keyword::If => self.parse_if(),
-        Keyword::Return => self.parse_return(),
-        _ => match self.parse_value() {
-          Ok(ast) => self.parse_extension(ast),
-          Err(e) => Err(e),
-        },
+      lexer::Token::Keyword(keyword) => {
+        self.dequeue()?;
+        match keyword {
+          Keyword::Const | Keyword::Let => self.parse_initialization(keyword.clone()),
+          Keyword::If => self.parse_if(),
+          Keyword::Return => self.parse_return(),
+          Keyword::Fn => self.parse_function(loc),
+          _ => return Err(AstError::UnexpectedToken(token.clone(), loc.clone())),
+        }
+      }
+      _ => match self.parse_value() {
+        Ok(ast) => self.parse_extension(ast),
+        e => e,
       },
-      _ => return Err(AstError::UnexpectedToken(token.clone(), loc.clone())),
     }
   }
 
@@ -617,12 +622,7 @@ impl Parser {
           "none" => AST::None(loc.clone()),
           _ => AST::Variable(identifier.clone(), loc.clone()),
         };
-        let (token, loc) = self.peek()?;
-        if let lexer::Token::Operator(OpType::LBraket) = token {
-          let types = self.parse_type_list()?;
-          return Ok(AST::GenericIdentifier(Box::new(ident), types, loc));
-        }
-        return Ok(ident);
+        return self.parse_extension(ident);
       }
       _ => Err(AstError::IdentifierExpected(loc.clone())),
     }
@@ -701,7 +701,7 @@ impl Parser {
                   generics,
                   params,
                   Box::new(AST::None(fn_loc.clone())),
-                  Box::new(self.parse_full_body(loc.clone())?),
+                  Box::new(self.parse_block(loc.clone())?),
                   loc,
                 ));
               }
@@ -759,19 +759,21 @@ impl Parser {
   pub fn parse_function_params(&mut self) -> Result<Vec<(AST, AST)>, AstError> {
     let mut params = Vec::new();
     loop {
-      let (token, _) = self.dequeue()?;
+      let (token, _) = self.peek()?;
       if let lexer::Token::Operator(OpType::RParen) = token {
+        self.dequeue()?;
         break;
       }
       let name = self.parse()?;
-      let (mut token, mut loc) = self.dequeue()?;
+      let (token, loc) = self.peek()?;
       if let lexer::Token::Operator(OpType::Colon) = token {
-        (token, loc) = self.dequeue()?;
+        self.dequeue()?;
         let ty = self.parse_type()?;
         params.push((name, ty));
       } else {
         params.push((name, AST::None(loc.clone())));
       }
+      let (token, loc) = self.dequeue()?;
       if let lexer::Token::Operator(OpType::Comma) = token {
       } else if let lexer::Token::Operator(OpType::RParen) = token {
         break;
@@ -1082,6 +1084,111 @@ mod tests {
           l(),
         )),
         l(),
+      ))
+    );
+  }
+
+  #[test]
+  fn test_parse_generic_fn() {
+    let l = || CodeLocation::new("base".to_string(), 0);
+    let tokens = vec![
+      (Token::Keyword(Keyword::Fn), l()),
+      (Token::Identifier("x".to_string()), l()),
+      (Token::Operator(OpType::Colon), l()),
+      (Token::Operator(OpType::LBraket), l()),
+      (Token::Identifier("T".to_string()), l()),
+      (Token::Operator(OpType::RBraket), l()),
+      (Token::Operator(OpType::LParen), l()),
+      (Token::Identifier("a".to_string()), l()),
+      (Token::Operator(OpType::Colon), l()),
+      (Token::Identifier("T".to_string()), l()),
+      (Token::Operator(OpType::RParen), l()),
+      (Token::Operator(OpType::LBrace), l()),
+      (Token::Operator(OpType::RBrace), l()),
+    ];
+    let ast = Parser::new(tokens).parse();
+    assert_eq!(
+      ast,
+      Ok(AST::FunctionDefinition(
+        "x".to_string(),
+        vec!["T".to_string()],
+        vec![(
+          AST::Variable("a".to_string(), l()),
+          AST::Variable("T".to_string(), l())
+        )],
+        Box::new(AST::None(l())),
+        Box::new(AST::Block(vec![], l(),)),
+        l()
+      ))
+    );
+  }
+
+  #[test]
+  fn test_parse_generic_fn_ret() {
+    let l = || CodeLocation::new("base".to_string(), 0);
+    let tokens = vec![
+      (Token::Keyword(Keyword::Fn), l()),
+      (Token::Identifier("x".to_string()), l()),
+      (Token::Operator(OpType::Colon), l()),
+      (Token::Operator(OpType::LBraket), l()),
+      (Token::Identifier("T".to_string()), l()),
+      (Token::Operator(OpType::RBraket), l()),
+      (Token::Operator(OpType::LParen), l()),
+      (Token::Identifier("a".to_string()), l()),
+      (Token::Operator(OpType::Colon), l()),
+      (Token::Identifier("T".to_string()), l()),
+      (Token::Operator(OpType::RParen), l()),
+      (Token::Operator(OpType::Colon), l()),
+      (Token::Identifier("T".to_string()), l()),
+      (Token::Operator(OpType::LBrace), l()),
+      (Token::Operator(OpType::RBrace), l()),
+    ];
+    let ast = Parser::new(tokens).parse();
+    assert_eq!(
+      ast,
+      Ok(AST::FunctionDefinition(
+        "x".to_string(),
+        vec!["T".to_string()],
+        vec![(
+          AST::Variable("a".to_string(), l()),
+          AST::Variable("T".to_string(), l())
+        )],
+        Box::new(AST::Variable("T".to_string(), l())),
+        Box::new(AST::Block(vec![], l(),)),
+        l()
+      ))
+    );
+  }
+
+  #[test]
+  fn test_parse_fn_ret() {
+    let l = || CodeLocation::new("base".to_string(), 0);
+    let tokens = vec![
+      (Token::Keyword(Keyword::Fn), l()),
+      (Token::Identifier("x".to_string()), l()),
+      (Token::Operator(OpType::LParen), l()),
+      (Token::Identifier("a".to_string()), l()),
+      (Token::Operator(OpType::Colon), l()),
+      (Token::Identifier("int".to_string()), l()),
+      (Token::Operator(OpType::RParen), l()),
+      (Token::Operator(OpType::Colon), l()),
+      (Token::Identifier("int".to_string()), l()),
+      (Token::Operator(OpType::LBrace), l()),
+      (Token::Operator(OpType::RBrace), l()),
+    ];
+    let ast = Parser::new(tokens).parse();
+    assert_eq!(
+      ast,
+      Ok(AST::FunctionDefinition(
+        "x".to_string(),
+        vec![],
+        vec![(
+          AST::Variable("a".to_string(), l()),
+          AST::Variable("int".to_string(), l())
+        )],
+        Box::new(AST::Variable("int".to_string(), l())),
+        Box::new(AST::Block(vec![], l(),)),
+        l()
       ))
     );
   }
