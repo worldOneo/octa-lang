@@ -136,11 +136,10 @@ pub type Program = Vec<Statement>;
 
 pub struct Interpreter {
   pub syntax: AST,
-  pub scope: Vec<HashMap<String, DataType>>,
   pub stack_sizes: Vec<usize>,
-  pub stack_offsets: Vec<HashMap<String, usize>>,
+  pub stack_offsets: Vec<Vec<HashMap<String, usize>>>,
   pub root_offsets: HashMap<String, usize>,
-  pub data_types: Vec<HashMap<String, DataType>>,
+  pub data_types: Vec<Vec<HashMap<String, DataType>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,24 +194,57 @@ impl Interpreter {
   pub fn new(syntax: AST) -> Interpreter {
     let mut interpreter = Interpreter {
       syntax,
-      scope: vec![HashMap::new()],
-      stack_offsets: vec![HashMap::new()],
+      stack_offsets: vec![vec![HashMap::new()]],
       stack_sizes: vec![0],
-      data_types: vec![HashMap::new()],
+      data_types: vec![vec![HashMap::new()]],
       root_offsets: HashMap::new(),
     };
-    interpreter.data_types[0].insert("int".to_string(), DataType::Int);
-    interpreter.data_types[0].insert("float".to_string(), DataType::Float);
-    interpreter.data_types[0].insert("bool".to_string(), DataType::Bool);
-    interpreter.data_types[0].insert("string".to_string(), DataType::String);
+    interpreter.data_types[0][0].insert("int".to_string(), DataType::Int);
+    interpreter.data_types[0][0].insert("float".to_string(), DataType::Float);
+    interpreter.data_types[0][0].insert("bool".to_string(), DataType::Bool);
+    interpreter.data_types[0][0].insert("string".to_string(), DataType::String);
     interpreter
   }
 
+  pub fn get_visible_scopes(&self) -> &Vec<HashMap<String, DataType>> {
+    &self.data_types[self.stack_sizes.len() - 1]
+  }
+
+  pub fn get_current_scope(&self) -> &HashMap<String, DataType> {
+    let scopes = self.get_visible_scopes();
+    &scopes[scopes.len() - 1]
+  }
+
+  pub fn get_root_scopes(&self) -> &HashMap<String, DataType> {
+    &self.data_types[0][0]
+  }
+
+  pub fn get_visible_offsets(&self) -> &Vec<HashMap<String, usize>> {
+    &self.stack_offsets[self.stack_sizes.len() - 1]
+  }
+
   pub fn type_by_name(&self, name: &String) -> Option<DataType> {
-    for scope in self.data_types.iter().rev() {
+    for scope in self.get_visible_scopes().iter().rev() {
       if let Some(ty) = scope.get(name) {
         return Some(ty.clone());
       }
+    }
+
+    if let Some(ty) = self.get_root_scopes().get(name) {
+      return Some(ty.clone());
+    }
+    None
+  }
+
+  pub fn offset_by_name(&self, name: &String) -> Option<usize> {
+    for scope in self.get_visible_offsets().iter().rev() {
+      if let Some(offset) = scope.get(name) {
+        return Some(*offset);
+      }
+    }
+
+    if let Some(offset) = self.root_offsets.get(name) {
+      return Some(*offset);
     }
     None
   }
@@ -393,7 +425,9 @@ impl Interpreter {
           match definition {
             AST::Initialize(AssignType::Type, name, ty, loc) => {
               let ty = self.resolve_type_def(&ty)?;
-              self.data_types[0].insert(as_name(&name, loc.clone())?, ty);
+              let name = as_name(&name, loc.clone())?;
+              self.stack_add(&name);
+              self.set_data_type(&name, ty);
             }
             AST::FunctionDefinition(name, generic, args, ret, body, loc) => {
               self.add_fn_def(name.clone(), &generic, &args, &ret, &body, loc.clone())?;
@@ -433,28 +467,13 @@ impl Interpreter {
     return Ok(program);
   }
 
-  fn get_data_types(&self) -> &HashMap<String, DataType> {
-    return &self.data_types[self.data_types.len() - 1];
-  }
-
-  fn get_visible_stack(&self) -> &HashMap<String, usize> {
-    return &self.stack_offsets[self.stack_offsets.len() - 1];
-  }
-
-  fn offset_by_name(&self, name: &str) -> Option<usize> {
-    let stack = self.get_visible_stack();
-    if stack.contains_key(name) {
-      return Some(stack[name]);
-    }
-    if self.root_offsets.contains_key(name) {
-      return Some(self.root_offsets[name]);
-    }
-    return None;
-  }
-
   fn set_data_offset(&mut self, name: &str, offset: usize) {
-    let last = self.data_types.len() - 1;
-    self.stack_offsets[last].insert(name.to_string(), offset);
+    let last = self.stack_offsets.len() - 1;
+    let last_scope = &mut self.stack_offsets[last];
+    last_scope
+      .last_mut()
+      .unwrap()
+      .insert(name.to_string(), offset);
   }
 
   fn get_stack_size(&self) -> usize {
@@ -473,19 +492,45 @@ impl Interpreter {
     self.data_types.pop();
   }
 
+  fn pop_scope(&mut self) {
+    let last = self.stack_sizes.len() - 1;
+    let scope_vars = self.get_current_scope().len();
+    self.stack_sizes[last] -= scope_vars;
+    self.stack_offsets.last_mut().unwrap().pop();
+    self.data_types.last_mut().unwrap().pop();
+  }
+
   fn add_stack(&mut self) {
-    self.stack_offsets.push(HashMap::new());
+    self.stack_offsets.push(vec![HashMap::new()]);
     self.stack_sizes.push(0);
-    self.data_types.push(HashMap::new());
+    self.data_types.push(vec![HashMap::new()]);
+  }
+
+  fn add_scope(&mut self) {
+    self.stack_offsets.last_mut().unwrap().push(HashMap::new());
+    self.data_types.last_mut().unwrap().push(HashMap::new());
+  }
+
+  fn stack_add(&mut self, name: &str) {
+    let last = self.stack_offsets.len() - 1;
+    let last_scope = &self.stack_offsets[last];
+    let scope = last_scope.last().unwrap();
+    if scope.contains_key(&name.to_string()) {
+      return;
+    }
+    let offset = self.inc_stack_size();
+    self.stack_offsets[last]
+      .last_mut()
+      .unwrap()
+      .insert(name.to_string(), offset);
   }
 
   fn set_data_type(&mut self, name: &String, ty: DataType) {
     let last = self.data_types.len() - 1;
-    if !self.get_data_types().contains_key(name) {
-      let size = self.inc_stack_size();
-      self.set_data_offset(name, size)
-    }
-    self.data_types[last].insert(name.clone(), ty);
+    self.data_types[last]
+      .last_mut()
+      .unwrap()
+      .insert(name.clone(), ty);
   }
 
   fn push_fn_offset(&self, callee: &AST, reg: Register) -> Result<(Program, DataType), BuildError> {
@@ -652,6 +697,7 @@ impl Interpreter {
             todo!();
           } else if let AST::Variable(id, _) = name {
             self.set_data_type(id, self.resolve_type_def(&ty)?);
+            self.stack_add(id);
           } else {
             todo!();
           }
@@ -703,18 +749,18 @@ impl Interpreter {
   ) -> Result<(), BuildError> {
     let mut parsed_args = Vec::new();
     if !generic.is_empty() {
-      let mut generic_types = HashMap::new();
+      self.add_scope(); // add generic resolved scope
       for (_, arg) in generic.iter().enumerate() {
         let arg_type = DataType::Generic(arg.clone());
-        generic_types.insert(arg.clone(), arg_type);
+        self.set_data_type(arg, arg_type);
+        self.stack_add(arg);
       }
-      self.data_types.push(generic_types);
     }
     for (lhs, rhs) in args {
       parsed_args.push(self.resolve_parameter_type(&lhs, &rhs)?);
     }
     let ret = self.resolve_type_def(ret)?;
-    let current = self.data_types[0].get(&name);
+    let current = self.type_by_name(&name);
     if let Some(current) = current {
       if let DataType::Function(current) = current {
         if current.args.len() != parsed_args.len() {
@@ -741,10 +787,10 @@ impl Interpreter {
       }
     }
     if !generic.is_empty() {
-      self.data_types.pop();
+      self.pop_scope(); // pop generic resolved scope
     }
-    self.data_types[0].insert(
-      name.clone(),
+    self.set_data_type(
+      &name.clone(),
       DataType::Function(Box::new(FunctionDataType {
         name,
         args: parsed_args,
@@ -785,11 +831,11 @@ mod tests {
 
     let mut interpreter = Interpreter::new(ast);
     interpreter.build_root_types().unwrap();
-    assert_eq!(interpreter.data_types[0].get("a"), Some(&DataType::Int));
-    assert_eq!(interpreter.data_types[0].get("b"), Some(&DataType::Bool));
-    assert_eq!(interpreter.data_types[0].get("c"), Some(&DataType::Float));
-    assert_eq!(interpreter.data_types[0].get("d"), Some(&DataType::String));
-    assert_eq!(interpreter.data_types[0].get("e"), Some(&DataType::Function(Box::new(FunctionDataType {
+    assert_eq!(interpreter.type_by_name(&"a".to_string()), Some(DataType::Int));
+    assert_eq!(interpreter.type_by_name(&"b".to_string()), Some(DataType::Bool));
+    assert_eq!(interpreter.type_by_name(&"c".to_string()), Some(DataType::Float));
+    assert_eq!(interpreter.type_by_name(&"d".to_string()), Some(DataType::String));
+    assert_eq!(interpreter.type_by_name(&"e".to_string()), Some(DataType::Function(Box::new(FunctionDataType {
       name: "e".to_string(),
       args: vec![DataType::Int, DataType::Map(Box::new(DataType::String), Box::new(DataType::Int))],
       ret: DataType::String,
@@ -814,13 +860,15 @@ mod tests {
 
     let mut interpreter = Interpreter::new(ast);
     interpreter.build_root_types().unwrap();
-    assert_eq!(interpreter.data_types[0].get("e"), Some(&DataType::Function(Box::new(FunctionDataType {
-      name: "e".to_string(),
-      args: vec![DataType::Generic("T".to_string())],
-      ret: DataType::Generic("T".to_string()),
-      is_generic: true,
-      generic_types: vec!["T".to_string()],
-    }))));
+    assert_eq!(interpreter.type_by_name(&"e".to_string()), Some(
+      DataType::Function(Box::new(FunctionDataType {
+        name: "e".to_string(),
+        args: vec![DataType::Generic("T".to_string())],
+        ret: DataType::Generic("T".to_string()),
+        is_generic: true,
+        generic_types: vec!["T".to_string()],
+      }
+    ))));
   }
 
   #[test]
@@ -855,8 +903,8 @@ mod tests {
     let mut interpreter = Interpreter::new(ast);
     interpreter.build_root_types().unwrap();
     assert_eq!(
-      interpreter.data_types[0].get("e"),
-      Some(&DataType::Function(Box::new(FunctionDataType {
+      interpreter.type_by_name(&"e".to_string()),
+      Some(DataType::Function(Box::new(FunctionDataType {
         name: "e".to_string(),
         args: vec![DataType::Generic("T".to_string())],
         ret: DataType::Generic("T".to_string()),
@@ -865,8 +913,8 @@ mod tests {
       })))
     );
     assert_eq!(
-      interpreter.data_types[0].get("i"),
-      Some(&DataType::GenericResolved(
+      interpreter.type_by_name(&"i".to_string()),
+      Some(DataType::GenericResolved(
         [("T".to_string(), DataType::Int)].iter().cloned().collect(),
         Box::new(DataType::Function(Box::new(FunctionDataType {
           name: "e".to_string(),
