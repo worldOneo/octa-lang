@@ -346,35 +346,33 @@ impl Interpreter {
         ))
       }
       AST::GenericIdentifier(ty, resolved, loc) => {
-        if let Some(ty) = self.type_by_name(ty) {
-          let mut args_ty = vec![];
-          for ty in resolved {
-            args_ty.push(self.resolve_type_def(ty)?);
-          }
-          let mut resolved_ty = HashMap::new();
-          match ty.clone() {
-            DataType::Function(func) => {
-              if func.generic_types.len() != args_ty.len() {
-                return Err(BuildError::GenericTypeMismatch(loc.clone()));
-              }
-              for (i, ty) in func.generic_types.iter().enumerate() {
-                resolved_ty.insert(ty.clone(), args_ty[i].clone());
-              }
-              return Ok(DataType::GenericResolved(resolved_ty, Box::new(ty.clone())));
-            }
-            DataType::Struct(stru) => {
-              if stru.generic_types.len() != args_ty.len() {
-                return Err(BuildError::GenericTypeMismatch(loc.clone()));
-              }
-              for (i, ty) in stru.generic_types.iter().enumerate() {
-                resolved_ty.insert(ty.clone(), args_ty[i].clone());
-              }
-              return Ok(DataType::GenericResolved(resolved_ty, Box::new(ty.clone())));
-            }
-            _ => {}
-          };
+        let ty = self.resolve_type_def(ty)?;
+        let mut args_ty = vec![];
+        for ty in resolved {
+          args_ty.push(self.resolve_type_def(ty)?);
         }
-        Err(BuildError::InvalidType(loc.clone()))
+        let mut resolved_ty = HashMap::new();
+        match ty.clone() {
+          DataType::Function(func) => {
+            if func.generic_types.len() != args_ty.len() {
+              return Err(BuildError::GenericTypeMismatch(loc.clone()));
+            }
+            for (i, ty) in func.generic_types.iter().enumerate() {
+              resolved_ty.insert(ty.clone(), args_ty[i].clone());
+            }
+            return Ok(DataType::GenericResolved(resolved_ty, Box::new(ty.clone())));
+          }
+          DataType::Struct(stru) => {
+            if stru.generic_types.len() != args_ty.len() {
+              return Err(BuildError::GenericTypeMismatch(loc.clone()));
+            }
+            for (i, ty) in stru.generic_types.iter().enumerate() {
+              resolved_ty.insert(ty.clone(), args_ty[i].clone());
+            }
+            return Ok(DataType::GenericResolved(resolved_ty, Box::new(ty.clone())));
+          }
+          _ => return Err(BuildError::GenericTypeMismatch(loc.clone())),
+        }
       }
       AST::IntLiteral(_, _) => Ok(DataType::Int),
       AST::FloatLiteral(_, _) => Ok(DataType::Float),
@@ -850,7 +848,7 @@ mod tests {
     let l = || lexer::CodeLocation::new("".to_string(), 0);
     let v = |s: &str| AST::Variable(s.to_string(), l());
     /*
-     fn e[T](a: T): T {
+     fn e:[T](a: T): T {
      }
     */
     let ast = AST::Block(vec![
@@ -876,9 +874,9 @@ mod tests {
     let l = || lexer::CodeLocation::new("".to_string(), 0);
     let v = |s: &str| AST::Variable(s.to_string(), l());
     /*
-    fn e[T](a: T): T {
+    fn e:[T](a: T): T {
     }
-    type i = e[int]
+    type i = e:[int]
     */
     let ast = AST::Block(
       vec![
@@ -893,7 +891,11 @@ mod tests {
         AST::Initialize(
           AssignType::Type,
           Box::new(v("i")),
-          Box::new(AST::GenericIdentifier("e".to_string(), vec![v("int")], l())),
+          Box::new(AST::GenericIdentifier(
+            Box::new(v("e")),
+            vec![v("int")],
+            l(),
+          )),
           l(),
         ),
       ],

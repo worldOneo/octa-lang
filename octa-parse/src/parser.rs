@@ -79,7 +79,7 @@ pub enum AST {
   IndexAccess(Box<AST>, Box<AST>, lexer::CodeLocation),
   If(Box<AST>, Box<AST>, Option<Box<AST>>, lexer::CodeLocation),
   Return(Option<Box<AST>>, lexer::CodeLocation),
-  GenericIdentifier(String, Vec<AST>, lexer::CodeLocation), // Func[asd,asd,asd]
+  GenericIdentifier(Box<AST>, Vec<AST>, lexer::CodeLocation), // Func[asd,asd,asd]
 }
 
 impl AST {
@@ -390,6 +390,16 @@ impl Parser {
               rloc,
             ))
           }
+        },
+        OpType::Colon => {
+          self.dequeue()?;
+          let (token, loc) = self.peek()?;
+          if let lexer::Token::Operator(OpType::LBraket) = token {
+            self.dequeue()?;
+            let args = self.parse_type_list()?;
+            return self.parse_extension(AST::GenericIdentifier(Box::new(ast), args, loc));
+          }
+          Ok(ast)
         }
         op_type if is_partial_bin_op(&op_type) => {
           if let Ok(Some(op)) = self.possbile_operator() {
@@ -605,12 +615,12 @@ impl Parser {
         let ident = match identifier.clone().as_str() {
           "int" | "bool" | "string" | "float" => AST::Variable(identifier.clone(), loc.clone()),
           "none" => AST::None(loc.clone()),
-          _ => return Err(AstError::UnexpectedToken(token, loc)),
+          _ => AST::Variable(identifier.clone(), loc.clone()),
         };
         let (token, loc) = self.peek()?;
         if let lexer::Token::Operator(OpType::LBraket) = token {
           let types = self.parse_type_list()?;
-          return Ok(AST::GenericIdentifier(identifier, types, loc));
+          return Ok(AST::GenericIdentifier(Box::new(ident), types, loc));
         }
         return Ok(ident);
       }
@@ -667,39 +677,47 @@ impl Parser {
             fn_loc,
           ));
         }
-        lexer::Token::Operator(OpType::LBraket) => {
-          let generics = self.parse_identifier_list(lexer::Token::Operator(OpType::RBraket))?;
+        lexer::Token::Operator(OpType::Colon) => {
           let (token, loc) = self.dequeue()?;
-          if let lexer::Token::Operator(OpType::LParen) = token {
-            let params = self.parse_function_params()?;
+          if let lexer::Token::Operator(OpType::LBraket) = token {
+            let generics = self.parse_identifier_list(lexer::Token::Operator(OpType::RBraket))?;
             let (token, loc) = self.dequeue()?;
-            if let lexer::Token::Operator(OpType::Colon) = token {
-              let return_type = self.parse_type()?;
-              return Ok(AST::FunctionDefinition(
-                name,
-                generics,
-                params,
-                Box::new(return_type),
-                Box::new(self.parse_full_body(loc.clone())?),
-                loc,
-              ));
+            if let lexer::Token::Operator(OpType::LParen) = token {
+              let params = self.parse_function_params()?;
+              let (token, loc) = self.dequeue()?;
+              if let lexer::Token::Operator(OpType::Colon) = token {
+                let return_type = self.parse_type()?;
+                return Ok(AST::FunctionDefinition(
+                  name,
+                  generics,
+                  params,
+                  Box::new(return_type),
+                  Box::new(self.parse_full_body(loc.clone())?),
+                  loc,
+                ));
+              } else {
+                return Ok(AST::FunctionDefinition(
+                  name,
+                  generics,
+                  params,
+                  Box::new(AST::None(fn_loc.clone())),
+                  Box::new(self.parse_full_body(loc.clone())?),
+                  loc,
+                ));
+              }
             } else {
-              return Ok(AST::FunctionDefinition(
-                name,
-                generics,
-                params,
-                Box::new(AST::None(fn_loc.clone())),
-                Box::new(self.parse_full_body(loc.clone())?),
+              return Err(AstError::TokenExpected(
+                lexer::Token::Operator(OpType::LParen),
+                Some(token),
                 loc,
               ));
             }
-          } else {
-            return Err(AstError::TokenExpected(
-              lexer::Token::Operator(OpType::LParen),
-              Some(token),
-              loc,
-            ));
           }
+          return Err(AstError::TokenExpected(
+            lexer::Token::Operator(OpType::LBraket),
+            Some(token),
+            loc,
+          ));
         }
         lexer::Token::Operator(OpType::LParen) => {
           let params = self.parse_function_params()?;
