@@ -67,7 +67,7 @@ pub enum AST {
   MapLiteral(Vec<(AST, AST)>, lexer::CodeLocation),
   StructLiteral(String, Vec<AST>, lexer::CodeLocation),
   StructDefinition(String, Vec<String>, Vec<(String, AST)>, lexer::CodeLocation),
-  FunctionDefinition(
+  Function(
     String,
     Vec<String>,
     Vec<(AST, AST)>,
@@ -75,6 +75,7 @@ pub enum AST {
     Box<AST>,
     lexer::CodeLocation,
   ),
+  FunctionDefinition(Vec<String>, Vec<(AST, AST)>, Box<AST>, lexer::CodeLocation),
   MemberAccess(Box<AST>, String, lexer::CodeLocation),
   IndexAccess(Box<AST>, Box<AST>, lexer::CodeLocation),
   If(Box<AST>, Box<AST>, Option<Box<AST>>, lexer::CodeLocation),
@@ -101,12 +102,13 @@ impl AST {
       AST::MapLiteral(.., loc) => loc,
       AST::StructLiteral(.., loc) => loc,
       AST::StructDefinition(.., loc) => loc,
-      AST::FunctionDefinition(.., loc) => loc,
+      AST::Function(.., loc) => loc,
       AST::MemberAccess(.., loc) => loc,
       AST::IndexAccess(.., loc) => loc,
       AST::If(.., loc) => loc,
       AST::Return(.., loc) => loc,
       AST::GenericIdentifier(.., loc) => loc,
+      AST::FunctionDefinition(.., loc) => loc,
     }
     .clone()
   }
@@ -138,7 +140,7 @@ impl AST {
       AST::StructDefinition(_, _, elements, _) => {
         elements.iter().map(|(_, b)| b).collect::<Vec<_>>()
       }
-      AST::FunctionDefinition(_, _, _, _, body, _) => vec![body],
+      AST::Function(_, _, _, _, body, _) => vec![body],
       AST::MemberAccess(obj, _, _) => vec![obj],
       AST::IndexAccess(obj, index, _) => vec![obj, index],
       AST::If(cond, then, els, _) => {
@@ -176,6 +178,8 @@ pub enum AstError {
   UnexpectedToken(lexer::Token, lexer::CodeLocation),
   TokenExpected(lexer::Token, Option<lexer::Token>, lexer::CodeLocation),
   IdentifierExpected(lexer::CodeLocation),
+  AssignmentExpected(lexer::CodeLocation),
+  AssignmentTypeExpected(lexer::CodeLocation),
   AstEnd,
 }
 
@@ -415,6 +419,7 @@ impl Parser {
             self.parse_extension(ast)
           } else {
             if op_type == OpType::Eq {
+              self.dequeue()?;
               let rhs = self.parse_value()?;
               return Ok(AST::Assign(Box::new(ast), Box::new(rhs), loc));
             }
@@ -428,27 +433,21 @@ impl Parser {
   }
 
   pub fn parse_initialization(&mut self, keyword: lexer::Keyword) -> Result<AST, AstError> {
-    let left_hand = self.parse_value()?;
-    let eq = self.dequeue()?;
-    if let lexer::Token::Operator(lexer::OpType::Eq) = eq.0 {
-      let right_hand = self.parse_value()?;
+    let assignment = self.parse_value()?;
+    if let AST::Assign(lhs, rhs, loc) = assignment {
       Ok(AST::Initialize(
         match keyword {
           lexer::Keyword::Let => AssignType::Let,
           lexer::Keyword::Const => AssignType::Const,
           lexer::Keyword::Type => AssignType::Type,
-          _ => return Err(AstError::UnexpectedToken(eq.0, eq.1)),
+          _ => return Err(AstError::AssignmentExpected(loc)),
         },
-        Box::new(left_hand),
-        Box::new(right_hand),
-        eq.1,
+        lhs,
+        rhs,
+        loc,
       ))
     } else {
-      Err(AstError::TokenExpected(
-        lexer::Token::Operator(lexer::OpType::Eq),
-        Some(eq.0),
-        eq.1,
-      ))
+      Err(AstError::AssignmentExpected(assignment.location()))
     }
   }
 
@@ -663,97 +662,62 @@ impl Parser {
   // fn Type foo[T, V](a: T): V {}
   pub fn parse_function(&mut self, fn_loc: lexer::CodeLocation) -> Result<AST, AstError> {
     let (token, loc) = self.dequeue()?;
-    if let lexer::Token::Identifier(name) = token {
-      let (token, loc) = self.dequeue()?;
-      match token {
-        lexer::Token::Operator(OpType::LBrace) => {
-          let body = self.parse_block(loc.clone())?;
-          return Ok(AST::FunctionDefinition(
-            name,
-            vec![],
-            vec![],
-            Box::new(AST::None(fn_loc.clone())),
-            Box::new(body),
-            fn_loc,
-          ));
-        }
-        lexer::Token::Operator(OpType::Colon) => {
-          let (token, loc) = self.dequeue()?;
-          if let lexer::Token::Operator(OpType::LBraket) = token {
-            let generics = self.parse_identifier_list(lexer::Token::Operator(OpType::RBraket))?;
-            let (token, loc) = self.dequeue()?;
-            if let lexer::Token::Operator(OpType::LParen) = token {
-              let params = self.parse_function_params()?;
-              let (token, loc) = self.dequeue()?;
-              if let lexer::Token::Operator(OpType::Colon) = token {
-                let return_type = self.parse_type()?;
-                return Ok(AST::FunctionDefinition(
-                  name,
-                  generics,
-                  params,
-                  Box::new(return_type),
-                  Box::new(self.parse_full_body(loc.clone())?),
-                  loc,
-                ));
-              } else {
-                return Ok(AST::FunctionDefinition(
-                  name,
-                  generics,
-                  params,
-                  Box::new(AST::None(fn_loc.clone())),
-                  Box::new(self.parse_block(loc.clone())?),
-                  loc,
-                ));
-              }
-            } else {
-              return Err(AstError::TokenExpected(
-                lexer::Token::Operator(OpType::LParen),
-                Some(token),
-                loc,
-              ));
-            }
-          }
+    let mut name = String::new();
+    if let lexer::Token::Identifier(id) = token {
+      name = id.clone();
+    }
+    let (token, loc) = self.peek()?;
+    let generics = match token {
+      lexer::Token::Operator(OpType::Colon) => {
+        self.dequeue()?;
+        let (token, loc) = self.dequeue()?;
+        if let lexer::Token::Operator(OpType::LBraket) = token {
+          self.parse_identifier_list(lexer::Token::Operator(OpType::RBraket))?
+        } else {
           return Err(AstError::TokenExpected(
             lexer::Token::Operator(OpType::LBraket),
             Some(token),
             loc,
           ));
         }
-        lexer::Token::Operator(OpType::LParen) => {
-          let params = self.parse_function_params()?;
-          let (token, loc) = self.dequeue()?;
-          if let lexer::Token::Operator(OpType::Colon) = token {
-            let return_type = self.parse()?;
-            return Ok(AST::FunctionDefinition(
-              name,
-              vec![],
-              params,
-              Box::new(return_type),
-              Box::new(self.parse_full_body(loc.clone())?),
-              loc,
-            ));
-          } else {
-            return Ok(AST::FunctionDefinition(
-              name,
-              vec![],
-              params,
-              Box::new(AST::None(fn_loc.clone())),
-              Box::new(self.parse_full_body(loc.clone())?),
-              loc,
-            ));
-          }
-        }
-        _ => {
-          return Err(AstError::TokenExpected(
-            lexer::Token::Operator(OpType::LBrace),
-            Some(token),
-            loc,
-          ))
-        }
       }
-    } else {
-      return Err(AstError::IdentifierExpected(loc));
+      _ => Vec::new(),
+    };
+
+    let (token, loc) = self.peek()?;
+    let params = match token {
+      lexer::Token::Operator(OpType::LParen) => {
+        self.dequeue()?;
+        self.parse_function_params()?
+      }
+      _ => Vec::new(),
+    };
+
+    let (token, loc) = self.peek()?;
+    let return_type = match token {
+      lexer::Token::Operator(OpType::Colon) => {
+        self.dequeue()?;
+        self.parse_type()?
+      }
+      _ => AST::None(loc.clone()),
+    };
+
+    if name == "".to_string() {
+      return Ok(AST::FunctionDefinition(
+        generics,
+        params,
+        Box::new(return_type),
+        fn_loc,
+      ));
     }
+    Ok(AST::Function(
+      name,
+      generics,
+      params,
+      Box::new(return_type),
+      Box::new(self.parse_full_body(fn_loc.clone())?),
+      fn_loc.clone(),
+    ))
   }
 
   pub fn parse_function_params(&mut self) -> Result<Vec<(AST, AST)>, AstError> {
@@ -1109,7 +1073,7 @@ mod tests {
     let ast = Parser::new(tokens).parse();
     assert_eq!(
       ast,
-      Ok(AST::FunctionDefinition(
+      Ok(AST::Function(
         "x".to_string(),
         vec!["T".to_string()],
         vec![(
@@ -1146,7 +1110,7 @@ mod tests {
     let ast = Parser::new(tokens).parse();
     assert_eq!(
       ast,
-      Ok(AST::FunctionDefinition(
+      Ok(AST::Function(
         "x".to_string(),
         vec!["T".to_string()],
         vec![(
@@ -1179,7 +1143,7 @@ mod tests {
     let ast = Parser::new(tokens).parse();
     assert_eq!(
       ast,
-      Ok(AST::FunctionDefinition(
+      Ok(AST::Function(
         "x".to_string(),
         vec![],
         vec![(

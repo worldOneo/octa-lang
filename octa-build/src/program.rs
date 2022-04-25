@@ -1,4 +1,4 @@
-use std::{collections::HashMap, iter::Product, vec};
+use std::{collections::HashMap, vec};
 
 use octa_lex::lexer;
 use octa_parse::parser::{AssignType, BinOpType, UnOpType, AST};
@@ -46,6 +46,11 @@ impl DataType {
     if self == other {
       return true;
     }
+    if let DataType::Const(inner) = self {
+      return inner.is_of(other);
+    } else if let DataType::Const(other) = other {
+      return self.is_of(other);
+    }
     if let DataType::Array(inner) = self {
       if let DataType::Array(other_inner) = other {
         return inner.is_of(other_inner);
@@ -76,6 +81,13 @@ impl DataType {
     }
 
     return false;
+  }
+
+  pub fn is_const(&self) -> bool {
+    match self {
+      DataType::Const(_) => true,
+      _ => false,
+    }
   }
 }
 
@@ -125,6 +137,10 @@ pub enum Statement {
     reg: Register,
     offset: usize,
   },
+  CopyFromReg {
+    reg: Register,
+    offset: usize,
+  },
 }
 const REG_A: Register = 0;
 const REG_B: Register = 1;
@@ -140,11 +156,14 @@ pub struct Interpreter {
   pub stack_offsets: Vec<Vec<HashMap<String, usize>>>,
   pub root_offsets: HashMap<String, usize>,
   pub data_types: Vec<Vec<HashMap<String, DataType>>>,
+  pub type_defs: Vec<Vec<HashMap<String, DataType>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BuildError {
   LefthandSideExpectedName(lexer::CodeLocation),
+  ConstantReassignment(lexer::CodeLocation),
+  TokenDoesntExist(lexer::CodeLocation),
   InvalidType(lexer::CodeLocation),
   PatternExpectd(lexer::CodeLocation),
   TypeHasNoMember(lexer::CodeLocation),
@@ -198,11 +217,12 @@ impl Interpreter {
       stack_sizes: vec![0],
       data_types: vec![vec![HashMap::new()]],
       root_offsets: HashMap::new(),
+      type_defs: vec![vec![HashMap::new()]],
     };
-    interpreter.data_types[0][0].insert("int".to_string(), DataType::Int);
-    interpreter.data_types[0][0].insert("float".to_string(), DataType::Float);
-    interpreter.data_types[0][0].insert("bool".to_string(), DataType::Bool);
-    interpreter.data_types[0][0].insert("string".to_string(), DataType::String);
+    interpreter.type_defs[0][0].insert("int".to_string(), DataType::Int);
+    interpreter.type_defs[0][0].insert("float".to_string(), DataType::Float);
+    interpreter.type_defs[0][0].insert("bool".to_string(), DataType::Bool);
+    interpreter.type_defs[0][0].insert("string".to_string(), DataType::String);
     interpreter
   }
 
@@ -236,6 +256,29 @@ impl Interpreter {
     None
   }
 
+  pub fn typedef_by_name(&self, name: &String) -> Option<DataType> {
+    for scope in self.type_defs.last().unwrap().iter().rev() {
+      if let Some(ty) = scope.get(name) {
+        return Some(ty.clone());
+      }
+    }
+
+    if let Some(ty) = self.type_defs[0][0].get(name) {
+      return Some(ty.clone());
+    }
+    None
+  }
+
+  pub fn set_typedef(&mut self, name: &String, ty: DataType) {
+    self
+      .type_defs
+      .last_mut()
+      .unwrap()
+      .last_mut()
+      .unwrap()
+      .insert(name.clone(), ty);
+  }
+
   pub fn offset_by_name(&self, name: &String) -> Option<usize> {
     for scope in self.get_visible_offsets().iter().rev() {
       if let Some(offset) = scope.get(name) {
@@ -266,20 +309,16 @@ impl Interpreter {
     }
   }
 
-  pub fn resolve_type_def(&self, ast: &AST) -> Result<DataType, BuildError> {
+  pub fn resolve_typedef(&mut self, ast: &AST) -> Result<DataType, BuildError> {
     match ast {
       AST::Variable(name, loc) => self
-        .type_by_name(name)
+        .typedef_by_name(name)
         .ok_or(BuildError::InvalidType(loc.clone())),
-      AST::MemberAccess(first, second, loc) => {
-        let first_ty = self.resolve_type_def(first)?;
-        self.get_member_type(first_ty, second, loc.clone())
-      }
       AST::StructDefinition(name, generics, fields, loc) => {
         let mut type_fields = HashMap::new();
         for field in fields {
           let field_name = field.0.clone();
-          let field_type = self.resolve_type_def(&field.1)?;
+          let field_type = self.resolve_typedef(&field.1)?;
           type_fields.insert(field_name, StructField { ty: field_type });
         }
         Ok(DataType::Struct(StructType {
@@ -289,12 +328,71 @@ impl Interpreter {
           is_generic: !generics.is_empty(),
         }))
       }
+      AST::GenericIdentifier(ty, resolved, loc) => {
+        let ty = self.resolve_typedef(ty)?;
+        self.resolve_generic_type(&ty, resolved, loc)
+      }
+      AST::FunctionDefinition(generics, args, ret, loc) => self.build_fn_def(
+        "".to_string(),
+        generics,
+        args,
+        ret,
+        &AST::Block(vec![], loc.clone()),
+        loc.clone(),
+      ),
+      _ => Err(BuildError::InvalidType(ast.location())),
+    }
+  }
+
+  pub fn resolve_generic_type(
+    &mut self,
+    ty: &DataType,
+    resolved: &Vec<AST>,
+    loc: &lexer::CodeLocation,
+  ) -> Result<DataType, BuildError> {
+    let mut args_ty = vec![];
+    for ty in resolved {
+      args_ty.push(self.resolve_typedef(ty)?);
+    }
+    let mut resolved_ty = HashMap::new();
+    match ty.clone() {
+      DataType::Function(func) => {
+        if func.generic_types.len() != args_ty.len() {
+          return Err(BuildError::GenericTypeMismatch(loc.clone()));
+        }
+        for (i, ty) in func.generic_types.iter().enumerate() {
+          resolved_ty.insert(ty.clone(), args_ty[i].clone());
+        }
+        return Ok(DataType::GenericResolved(resolved_ty, Box::new(ty.clone())));
+      }
+      DataType::Struct(stru) => {
+        if stru.generic_types.len() != args_ty.len() {
+          return Err(BuildError::GenericTypeMismatch(loc.clone()));
+        }
+        for (i, ty) in stru.generic_types.iter().enumerate() {
+          resolved_ty.insert(ty.clone(), args_ty[i].clone());
+        }
+        return Ok(DataType::GenericResolved(resolved_ty, Box::new(ty.clone())));
+      }
+      _ => return Err(BuildError::GenericTypeMismatch(loc.clone())),
+    }
+  }
+
+  pub fn resolve_type(&mut self, ast: &AST) -> Result<DataType, BuildError> {
+    match ast {
+      AST::Variable(name, loc) => self
+        .type_by_name(name)
+        .ok_or(BuildError::InvalidType(loc.clone())),
+      AST::MemberAccess(first, second, loc) => {
+        let first_ty = self.resolve_type(first)?;
+        self.get_member_type(first_ty, second, loc.clone())
+      }
       AST::Call(callee, args, loc) => {
-        let callee_ty = self.resolve_type_def(callee)?;
+        let callee_ty = self.resolve_type(callee)?;
         if let DataType::Function(func) = callee_ty {
           let mut args_ty = vec![];
           for arg in args {
-            args_ty.push(self.resolve_type_def(arg)?);
+            args_ty.push(self.resolve_type(arg)?);
           }
           args_match(&func.args, &args_ty, loc.clone())?;
           return Ok(func.ret.clone());
@@ -308,9 +406,9 @@ impl Interpreter {
           if let AST::Variable(_, _) = &kv.0 {
             keys.push(DataType::String);
           } else {
-            keys.push(self.resolve_type_def(&kv.0)?);
+            keys.push(self.resolve_type(&kv.0)?);
           }
-          vals.push(self.resolve_type_def(&kv.1)?);
+          vals.push(self.resolve_type(&kv.1)?);
         }
         let key_ty = Interpreter::create_lowest_applicable_type(&keys);
         let val_ty = Interpreter::create_lowest_applicable_type(&vals);
@@ -322,7 +420,7 @@ impl Interpreter {
       AST::ArrayLiteral(vals, loc) => {
         let mut vals_ty = vec![];
         for val in vals {
-          vals_ty.push(self.resolve_type_def(val)?);
+          vals_ty.push(self.resolve_type(val)?);
         }
         let ty = Interpreter::create_lowest_applicable_type(&vals_ty);
         if ty == DataType::None {
@@ -331,8 +429,8 @@ impl Interpreter {
         Ok(DataType::Array(Box::new(ty)))
       }
       AST::BinOp(first, op, second, loc) => {
-        let first = self.resolve_type_def(first)?;
-        let second = self.resolve_type_def(second)?;
+        let first = self.resolve_type(first)?;
+        let second = self.resolve_type(second)?;
         if op.is_comparison() {
           return Ok(DataType::Bool);
         }
@@ -346,33 +444,8 @@ impl Interpreter {
         ))
       }
       AST::GenericIdentifier(ty, resolved, loc) => {
-        let ty = self.resolve_type_def(ty)?;
-        let mut args_ty = vec![];
-        for ty in resolved {
-          args_ty.push(self.resolve_type_def(ty)?);
-        }
-        let mut resolved_ty = HashMap::new();
-        match ty.clone() {
-          DataType::Function(func) => {
-            if func.generic_types.len() != args_ty.len() {
-              return Err(BuildError::GenericTypeMismatch(loc.clone()));
-            }
-            for (i, ty) in func.generic_types.iter().enumerate() {
-              resolved_ty.insert(ty.clone(), args_ty[i].clone());
-            }
-            return Ok(DataType::GenericResolved(resolved_ty, Box::new(ty.clone())));
-          }
-          DataType::Struct(stru) => {
-            if stru.generic_types.len() != args_ty.len() {
-              return Err(BuildError::GenericTypeMismatch(loc.clone()));
-            }
-            for (i, ty) in stru.generic_types.iter().enumerate() {
-              resolved_ty.insert(ty.clone(), args_ty[i].clone());
-            }
-            return Ok(DataType::GenericResolved(resolved_ty, Box::new(ty.clone())));
-          }
-          _ => return Err(BuildError::GenericTypeMismatch(loc.clone())),
-        }
+        let ty = self.resolve_type(ty)?;
+        self.resolve_generic_type(&ty, resolved, loc)
       }
       AST::IntLiteral(_, _) => Ok(DataType::Int),
       AST::FloatLiteral(_, _) => Ok(DataType::Float),
@@ -422,13 +495,14 @@ impl Interpreter {
         for definition in definitions {
           match definition {
             AST::Initialize(AssignType::Type, name, ty, loc) => {
-              let ty = self.resolve_type_def(&ty)?;
+              let ty = self.resolve_typedef(&ty)?;
               let name = as_name(&name, loc.clone())?;
-              self.stack_add(&name);
-              self.set_data_type(&name, ty);
+              self.set_typedef(&name, ty);
             }
-            AST::FunctionDefinition(name, generic, args, ret, body, loc) => {
-              self.add_fn_def(name.clone(), &generic, &args, &ret, &body, loc.clone())?;
+            AST::Function(name, generic, args, ret, body, loc) => {
+              let ty =
+                self.build_fn_def(name.clone(), &generic, &args, &ret, &body, loc.clone())?;
+              self.set_data_type(name, ty);
             }
             _ => Err(BuildError::TopLevelOperationExpected(definition.location()))?,
           }
@@ -636,7 +710,7 @@ impl Interpreter {
         let program = self.buld_initialize(lhs, rhs)?;
         return Ok(program);
       }
-      AST::FunctionDefinition(..) => self.build_fn(stmt),
+      AST::Function(..) => self.build_fn(stmt),
       AST::Return(value, _) => {
         let mut program = vec![];
         if let Some(value) = value {
@@ -685,7 +759,7 @@ impl Interpreter {
   fn build_fn(&mut self, ast: &AST) -> Result<Program, BuildError> {
     let mut program = vec![];
     match ast {
-      AST::FunctionDefinition(name, generics, args, _, body, loc) => {
+      AST::Function(name, generics, args, _, body, loc) => {
         self.add_stack();
         for gen in generics {
           self.set_data_type(gen, DataType::Generic(gen.clone()));
@@ -694,7 +768,8 @@ impl Interpreter {
           if name.is_pattern() {
             todo!();
           } else if let AST::Variable(id, _) = name {
-            self.set_data_type(id, self.resolve_type_def(&ty)?);
+            let ty = self.resolve_typedef(&ty)?;
+            self.set_data_type(id, ty);
             self.stack_add(id);
           } else {
             todo!();
@@ -712,7 +787,31 @@ impl Interpreter {
     return Ok(program);
   }
 
-  pub fn resolve_pattern_type(&self, pattern: &AST) -> Result<DataType, BuildError> {
+  pub fn build_assign(&mut self, lhs: &AST, rhs: &AST) -> Result<Program, BuildError> {
+    if lhs.is_pattern() {
+      todo!()
+    }
+    let (mut program, ty) = self.build_value_to_reg(rhs, REG_RETURN)?;
+    if let AST::Variable(name, _) = lhs {
+      if let Some(full) = self.type_by_name(name) {
+        if !ty.is_of(&full) {
+          return Err(BuildError::InvalidType(lhs.location()));
+        } else if full.is_const() {
+          return Err(BuildError::ConstantReassignment(lhs.location()));
+        }
+      }
+      program.push(Statement::CopyFromReg {
+        reg: REG_RETURN,
+        offset: self.offset_by_name(name).unwrap(),
+      });
+    } else {
+      return Err(BuildError::TokenDoesntExist(lhs.location()));
+    }
+    Ok(program)
+  }
+
+  pub fn resolve_pattern_type(&mut self, pattern: &AST) -> Result<DataType, BuildError> {
+    // Might be obsolete
     if !pattern.is_pattern() {
       return Err(BuildError::PatternExpectd(pattern.location()));
     }
@@ -722,21 +821,21 @@ impl Interpreter {
       AST::BoolLiteral(..) => Ok(DataType::Bool),
       AST::StringLiteral(..) => Ok(DataType::String),
       AST::MapLiteral(..) | AST::ArrayLiteral(..) | AST::StructLiteral(..) => {
-        self.resolve_type_def(&pattern)
+        self.resolve_type(&pattern)
       }
       _ => Err(BuildError::PatternExpectd(pattern.location())),
     }
   }
 
-  pub fn resolve_parameter_type(&self, lhs: &AST, rhs: &AST) -> Result<DataType, BuildError> {
+  pub fn resolve_parameter_type(&mut self, lhs: &AST, rhs: &AST) -> Result<DataType, BuildError> {
     if lhs.is_pattern() {
       self.resolve_pattern_type(lhs)
     } else {
-      self.resolve_type_def(rhs)
+      self.resolve_typedef(rhs)
     }
   }
 
-  pub fn add_fn_def(
+  pub fn build_fn_def(
     &mut self,
     name: String,
     generic: &Vec<String>,
@@ -744,20 +843,19 @@ impl Interpreter {
     ret: &AST,
     body: &AST,
     loc: lexer::CodeLocation,
-  ) -> Result<(), BuildError> {
+  ) -> Result<DataType, BuildError> {
     let mut parsed_args = Vec::new();
     if !generic.is_empty() {
       self.add_scope(); // add generic resolved scope
-      for (_, arg) in generic.iter().enumerate() {
+      for arg in generic.iter() {
         let arg_type = DataType::Generic(arg.clone());
-        self.set_data_type(arg, arg_type);
-        self.stack_add(arg);
+        self.set_typedef(arg, arg_type);
       }
     }
     for (lhs, rhs) in args {
       parsed_args.push(self.resolve_parameter_type(&lhs, &rhs)?);
     }
-    let ret = self.resolve_type_def(ret)?;
+    let ret = self.resolve_typedef(ret)?;
     let current = self.type_by_name(&name);
     if let Some(current) = current {
       if let DataType::Function(current) = current {
@@ -787,17 +885,13 @@ impl Interpreter {
     if !generic.is_empty() {
       self.pop_scope(); // pop generic resolved scope
     }
-    self.set_data_type(
-      &name.clone(),
-      DataType::Function(Box::new(FunctionDataType {
-        name,
-        args: parsed_args,
-        ret,
-        is_generic: !generic.is_empty(),
-        generic_types: generic.clone(),
-      })),
-    );
-    Ok(())
+    Ok(DataType::Function(Box::new(FunctionDataType {
+      name,
+      args: parsed_args,
+      ret,
+      is_generic: !generic.is_empty(),
+      generic_types: generic.clone(),
+    })))
   }
 }
 
@@ -815,24 +909,24 @@ mod tests {
      type f = float
      type b = bool
      type s = string
-     fn e(a: int, {a: 1}): string{}
+     fn e(a: i, {a: 1}): string{}
     */
     let ast = AST::Block(vec![
-      AST::Initialize(AssignType::Type,  Box::new(v("a")), Box::new(v("int")), l()),
+      AST::Initialize(AssignType::Type, Box::new(v("a")), Box::new(v("int")), l()),
       AST::Initialize(AssignType::Type, Box::new(v("b")), Box::new(v("bool")), l()),
       AST::Initialize(AssignType::Type, Box::new(v("c")), Box::new(v("float")), l()),
       AST::Initialize(AssignType::Type, Box::new(v("d")), Box::new(v("string")), l()),
-      AST::FunctionDefinition("e".to_string(), vec![], vec![(v("a"), v("int")), (
+      AST::Function("e".to_string(), vec![], vec![(v("a"), v("int")), (
                 AST::MapLiteral(vec![(v("a"), AST::IntLiteral(1, l()))], l()), AST::None(l()))],
                 Box::new(v("string")), Box::new(AST::Block(vec![], l())), l())
     ], l());
 
     let mut interpreter = Interpreter::new(ast);
     interpreter.build_root_types().unwrap();
-    assert_eq!(interpreter.type_by_name(&"a".to_string()), Some(DataType::Int));
-    assert_eq!(interpreter.type_by_name(&"b".to_string()), Some(DataType::Bool));
-    assert_eq!(interpreter.type_by_name(&"c".to_string()), Some(DataType::Float));
-    assert_eq!(interpreter.type_by_name(&"d".to_string()), Some(DataType::String));
+    assert_eq!(interpreter.typedef_by_name(&"a".to_string()), Some(DataType::Int));
+    assert_eq!(interpreter.typedef_by_name(&"b".to_string()), Some(DataType::Bool));
+    assert_eq!(interpreter.typedef_by_name(&"c".to_string()), Some(DataType::Float));
+    assert_eq!(interpreter.typedef_by_name(&"d".to_string()), Some(DataType::String));
     assert_eq!(interpreter.type_by_name(&"e".to_string()), Some(DataType::Function(Box::new(FunctionDataType {
       name: "e".to_string(),
       args: vec![DataType::Int, DataType::Map(Box::new(DataType::String), Box::new(DataType::Int))],
@@ -852,7 +946,7 @@ mod tests {
      }
     */
     let ast = AST::Block(vec![
-      AST::FunctionDefinition("e".to_string(), vec!["T".to_string()], vec![(v("a"), v("T"))],
+      AST::Function("e".to_string(), vec!["T".to_string()], vec![(v("a"), v("T"))],
                 Box::new(v("T")), Box::new(AST::Block(vec![], l())), l())
     ], l());
 
@@ -874,52 +968,36 @@ mod tests {
     let l = || lexer::CodeLocation::new("".to_string(), 0);
     let v = |s: &str| AST::Variable(s.to_string(), l());
     /*
-    fn e:[T](a: T): T {
-    }
-    type i = e:[int]
+    type f = fn [T](a: T): T
+    type i = f:[int]
     */
     let ast = AST::Block(
-      vec![
-        AST::FunctionDefinition(
-          "e".to_string(),
-          vec!["T".to_string()],
-          vec![(v("a"), v("T"))],
-          Box::new(v("T")),
-          Box::new(AST::Block(vec![], l())),
-          l(),
-        ),
-        AST::Initialize(
-          AssignType::Type,
-          Box::new(v("i")),
-          Box::new(AST::GenericIdentifier(
-            Box::new(v("e")),
-            vec![v("int")],
+      vec![AST::Initialize(
+        AssignType::Type,
+        Box::new(v("i")),
+        Box::new(AST::GenericIdentifier(
+          Box::new(AST::FunctionDefinition(
+            vec!["T".to_string()],
+            vec![(v("a"), v("T"))],
+            Box::new(v("T")),
             l(),
           )),
+          vec![v("int")],
           l(),
-        ),
-      ],
+        )),
+        l(),
+      )],
       l(),
     );
 
     let mut interpreter = Interpreter::new(ast);
     interpreter.build_root_types().unwrap();
     assert_eq!(
-      interpreter.type_by_name(&"e".to_string()),
-      Some(DataType::Function(Box::new(FunctionDataType {
-        name: "e".to_string(),
-        args: vec![DataType::Generic("T".to_string())],
-        ret: DataType::Generic("T".to_string()),
-        is_generic: true,
-        generic_types: vec!["T".to_string()],
-      })))
-    );
-    assert_eq!(
-      interpreter.type_by_name(&"i".to_string()),
+      interpreter.typedef_by_name(&"i".to_string()),
       Some(DataType::GenericResolved(
         [("T".to_string(), DataType::Int)].iter().cloned().collect(),
         Box::new(DataType::Function(Box::new(FunctionDataType {
-          name: "e".to_string(),
+          name: "".to_string(),
           args: vec![DataType::Generic("T".to_string())],
           ret: DataType::Generic("T".to_string()),
           generic_types: vec!["T".to_string()],
@@ -940,7 +1018,7 @@ mod tests {
      }
     */
     let ast = AST::Block(vec![
-      AST::FunctionDefinition("e".to_string(), vec![], vec![(v("a"), v("int")), (v("b"), v("int"))],
+      AST::Function("e".to_string(), vec![], vec![(v("a"), v("int")), (v("b"), v("int"))],
                 Box::new(v("int")), Box::new(AST::Block(vec![
                   AST::Return(
                     Some(
