@@ -1,7 +1,7 @@
 use std::{collections::HashMap, vec};
 
 use octa_lex::lexer;
-use octa_parse::parser::{AssignType, BinOpType, UnOpType, AST};
+use octa_parse::parser::{self, AssignType, BinOpType, UnOpType, AST};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructField {
@@ -583,18 +583,19 @@ impl Interpreter {
     self.data_types.last_mut().unwrap().push(HashMap::new());
   }
 
-  fn stack_add(&mut self, name: &str) {
+  fn stack_add(&mut self, name: &str) -> usize {
     let last = self.stack_offsets.len() - 1;
     let last_scope = &self.stack_offsets[last];
     let scope = last_scope.last().unwrap();
     if scope.contains_key(&name.to_string()) {
-      return;
+      return scope[&name.to_string()];
     }
     let offset = self.inc_stack_size();
     self.stack_offsets[last]
       .last_mut()
       .unwrap()
       .insert(name.to_string(), offset);
+    offset
   }
 
   fn set_data_type(&mut self, name: &String, ty: DataType) {
@@ -692,13 +693,30 @@ impl Interpreter {
     self.build_value_to_reg(value, REG_RETURN)
   }
 
-  fn buld_initialize(&mut self, lhs: &AST, rhs: &AST) -> Result<Program, BuildError> {
+  fn build_initialize(
+    &mut self,
+    assign_type: parser::AssignType,
+    lhs: &AST,
+    rhs: &AST,
+  ) -> Result<Program, BuildError> {
     if lhs.is_pattern() {
       return todo!();
     }
     if let AST::Variable(name, _) = lhs {
-      let (program, ty) = self.build_value_to_reg(rhs, REG_RETURN)?;
-      self.set_data_type(name, ty);
+      let (mut program, ty) = self.build_value_to_reg(rhs, REG_RETURN)?;
+      self.set_data_type(
+        name,
+        if assign_type == parser::AssignType::Let {
+          ty
+        } else {
+          DataType::Const(Box::new(ty))
+        },
+      );
+      let offset = self.stack_add(name);
+      program.push(Statement::CopyFromReg {
+        reg: REG_RETURN,
+        offset,
+      });
       return Ok(program);
     }
     return todo!();
@@ -707,9 +725,10 @@ impl Interpreter {
   fn build_statement(&mut self, stmt: &AST) -> Result<Program, BuildError> {
     match stmt {
       AST::Initialize(assign_type, lhs, rhs, _) => {
-        let program = self.buld_initialize(lhs, rhs)?;
+        let program = self.build_initialize(assign_type.clone(), lhs, rhs)?;
         return Ok(program);
       }
+      AST::Assign(lhs, rhs, _) => self.build_assign(lhs, rhs),
       AST::Function(..) => self.build_fn(stmt),
       AST::Return(value, _) => {
         let mut program = vec![];
@@ -897,6 +916,8 @@ impl Interpreter {
 
 #[cfg(test)]
 mod tests {
+  use octa_parse::parser;
+
   use super::*;
 
   #[test]
@@ -1026,6 +1047,54 @@ mod tests {
                     ), l()
                   )
                 ], l())), l())
+    ], l());
+
+    let mut interpreter = Interpreter::new(ast);
+    println!("{:?}", interpreter.build().unwrap()); // Visual check iguess (^_^)
+  }
+  #[test]
+  #[rustfmt::skip]
+  fn test_build_init_read() {
+    let l = || lexer::CodeLocation::new("".to_string(), 0);
+    let v = |s: &str| AST::Variable(s.to_string(), l());
+    /*
+     fn e(a: int, b: int) {
+      let c = a + b
+      let d = c + 1
+      c = d
+     }
+    */
+    let ast = AST::Block(vec![
+      AST::Function("e".to_string(), vec![], vec![(v("a"), v("int")), (v("b"), v("int"))],
+                Box::new(v("int")), Box::new(AST::Block(vec![
+                  AST::Initialize(
+                    parser::AssignType::Let,
+                    Box::new(v("c")),
+                      Box::new(AST::BinOp(
+                        Box::new(AST::Variable("a".to_string(), l())),
+                        BinOpType::Add,
+                        Box::new(AST::Variable("b".to_string(), l())),
+                        l(),
+                      )
+                    ),
+                    l()
+                  ),
+                  AST::Initialize(
+                    parser::AssignType::Let,
+                    Box::new(v("d")),
+                      Box::new(AST::BinOp(
+                        Box::new(AST::Variable("c".to_string(), l())),
+                        BinOpType::Add,
+                        Box::new(AST::IntLiteral(1, l())),
+                        l(),
+                      )
+                    ),
+                    l()
+                  ),
+                  AST::Assign(Box::new(v("c")), Box::new(v("d")), l()),
+                ],
+              l())),
+            l())
     ], l());
 
     let mut interpreter = Interpreter::new(ast);
