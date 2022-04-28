@@ -445,10 +445,7 @@ mod tests {
       lexer.pull_token(),
       Ok(super::Token::Operator(super::OpType::Eq))
     );
-    assert_eq!(
-      lexer.pull_token(),
-      Ok(super::Token::Bool(true))
-    );
+    assert_eq!(lexer.pull_token(), Ok(super::Token::Bool(true)));
     assert_eq!(lexer.pull_token(), Err(LexerError::EndOfCode));
   }
 

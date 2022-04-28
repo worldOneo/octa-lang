@@ -18,13 +18,12 @@ pub struct StructType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DataType {
+  Unresolved,
   None,
   Int,
   Float,
   Bool,
   String,
-  Array(Box<DataType>),
-  Map(Box<DataType>, Box<DataType>),
   Struct(StructType),
   Function(Box<FunctionDataType>),
   Generic(String),
@@ -42,30 +41,20 @@ pub struct FunctionDataType {
 }
 
 impl DataType {
-  pub fn is_of(&self, other: &DataType) -> bool {
+  pub fn satisfies(&self, other: &DataType) -> bool {
     if self == other {
       return true;
     }
     if let DataType::Const(inner) = self {
-      return inner.is_of(other);
+      return inner.satisfies(other);
     } else if let DataType::Const(other) = other {
-      return self.is_of(other);
-    }
-    if let DataType::Array(inner) = self {
-      if let DataType::Array(other_inner) = other {
-        return inner.is_of(other_inner);
-      }
-    }
-    if let DataType::Map(inner_key, inner_value) = self {
-      if let DataType::Map(other_key, other_value) = other {
-        return inner_key.is_of(other_key) && inner_value.is_of(other_value);
-      }
+      return self.satisfies(other);
     }
     if let DataType::Struct(inner) = self {
       if let DataType::Struct(other_inner) = other {
-        return inner.fields.iter().find(|(name, ty)| {
-          other_inner.fields.contains_key(*name) && other_inner.fields[*name].ty.is_of(&ty.ty)
-        }) != None;
+        return inner.fields.iter().all(|(name, ty)| {
+          other_inner.fields.contains_key(name) && other_inner.fields[name].ty.satisfies(&ty.ty)
+        });
       }
     }
     if let DataType::Function(inner) = self {
@@ -75,8 +64,8 @@ impl DataType {
             .args
             .iter()
             .zip(other_inner.args.iter())
-            .all(|(a, b)| a.is_of(&b))
-          && inner.ret.is_of(&other_inner.ret);
+            .all(|(a, b)| a.satisfies(&b))
+          && inner.ret.satisfies(&other_inner.ret);
       }
     }
 
@@ -105,8 +94,13 @@ type Register = u8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-  Jmp,
-  JmpIf,
+  Jmp {
+    offset: isize,
+  },
+  JmpIf {
+    reg: Register,
+    offset: isize,
+  },
   Call,
   Ret,
   Push {
@@ -141,6 +135,16 @@ pub enum Statement {
     reg: Register,
     offset: usize,
   },
+  MapGet {
+    reg: Register,
+    key: Register,
+    map: Register,
+  },
+  ArrayGet {
+    reg: Register,
+    index: Register,
+    array: Register,
+  },
 }
 const REG_A: Register = 0;
 const REG_B: Register = 1;
@@ -152,11 +156,11 @@ pub type Program = Vec<Statement>;
 
 pub struct Interpreter {
   pub syntax: AST,
-  pub stack_sizes: Vec<usize>,
-  pub stack_offsets: Vec<Vec<HashMap<String, usize>>>,
+  pub stack_sizes: usize,
+  pub stack_offsets: Vec<HashMap<String, usize>>,
   pub root_offsets: HashMap<String, usize>,
-  pub data_types: Vec<Vec<HashMap<String, DataType>>>,
-  pub type_defs: Vec<Vec<HashMap<String, DataType>>>,
+  pub data_types: Vec<HashMap<String, DataType>>,
+  pub type_defs: Vec<HashMap<String, DataType>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -198,7 +202,7 @@ pub fn args_match(
     ));
   }
   for (arg, param) in args.iter().zip(params.iter()) {
-    if !arg.is_of(param) {
+    if !arg.satisfies(param) {
       return Err(BuildError::ParameterTypeMismatch(
         arg.clone(),
         param.clone(),
@@ -213,21 +217,101 @@ impl Interpreter {
   pub fn new(syntax: AST) -> Interpreter {
     let mut interpreter = Interpreter {
       syntax,
-      stack_offsets: vec![vec![HashMap::new()]],
-      stack_sizes: vec![0],
-      data_types: vec![vec![HashMap::new()]],
+      stack_offsets: vec![HashMap::new()],
+      stack_sizes: 0,
+      data_types: vec![HashMap::new()],
       root_offsets: HashMap::new(),
-      type_defs: vec![vec![HashMap::new()]],
+      type_defs: vec![HashMap::new()],
     };
-    interpreter.type_defs[0][0].insert("int".to_string(), DataType::Int);
-    interpreter.type_defs[0][0].insert("float".to_string(), DataType::Float);
-    interpreter.type_defs[0][0].insert("bool".to_string(), DataType::Bool);
-    interpreter.type_defs[0][0].insert("string".to_string(), DataType::String);
+    interpreter.type_defs[0].insert("int".to_string(), DataType::Int);
+    interpreter.type_defs[0].insert("float".to_string(), DataType::Float);
+    interpreter.type_defs[0].insert("bool".to_string(), DataType::Bool);
+    interpreter.type_defs[0].insert("string".to_string(), DataType::String);
+    interpreter.type_defs[0].insert(
+      "map".to_string(),
+      DataType::Struct(StructType {
+        name: "map".to_string(),
+        fields: HashMap::new(),
+        generic_types: vec!["K".to_string(), "V".to_string()],
+        is_generic: true,
+      }),
+    );
+    interpreter.type_defs[0].insert(
+      "array".to_string(),
+      DataType::Struct(StructType {
+        name: "array".to_string(),
+        fields: HashMap::new(),
+        generic_types: vec!["T".to_string()],
+        is_generic: true,
+      }),
+    );
     interpreter
   }
 
+  fn build_map_type(k: &DataType, v: &DataType) -> DataType {
+    DataType::GenericResolved(
+      [("K".to_string(), k.clone()), ("V".to_string(), v.clone())]
+        .iter()
+        .cloned()
+        .collect(),
+      Box::new(DataType::Struct(StructType {
+        name: "map".to_string(),
+        fields: HashMap::new(),
+        generic_types: vec!["K".to_string(), "V".to_string()],
+        is_generic: true,
+      })),
+    )
+  }
+
+  fn as_map_key_val(map: &DataType) -> Option<(DataType, DataType)> {
+    match map {
+      DataType::GenericResolved(args, strct) => {
+        if let DataType::Struct(ty) = strct.as_ref() {
+          if ty.name != "map" {
+            return None;
+          }
+          let k = args.get("K").unwrap().clone();
+          let v = args.get("V").unwrap().clone();
+          Some((k, v))
+        } else {
+          None
+        }
+      }
+      _ => None,
+    }
+  }
+
+  fn as_array_val(array: &DataType) -> Option<DataType> {
+    match array {
+      DataType::GenericResolved(args, strct) => {
+        if let DataType::Struct(ty) = strct.as_ref() {
+          if ty.name != "array" {
+            return None;
+          }
+          let v = args.get("T").unwrap().clone();
+          Some(v)
+        } else {
+          None
+        }
+      }
+      _ => None,
+    }
+  }
+
+  fn build_array_type(t: &DataType) -> DataType {
+    DataType::GenericResolved(
+      [("T".to_string(), t.clone())].iter().cloned().collect(),
+      Box::new(DataType::Struct(StructType {
+        name: "array".to_string(),
+        fields: HashMap::new(),
+        generic_types: vec!["T".to_string()],
+        is_generic: true,
+      })),
+    )
+  }
+
   pub fn get_visible_scopes(&self) -> &Vec<HashMap<String, DataType>> {
-    &self.data_types[self.stack_sizes.len() - 1]
+    &self.data_types
   }
 
   pub fn get_current_scope(&self) -> &HashMap<String, DataType> {
@@ -236,11 +320,11 @@ impl Interpreter {
   }
 
   pub fn get_root_scopes(&self) -> &HashMap<String, DataType> {
-    &self.data_types[0][0]
+    &self.data_types[0]
   }
 
   pub fn get_visible_offsets(&self) -> &Vec<HashMap<String, usize>> {
-    &self.stack_offsets[self.stack_sizes.len() - 1]
+    &self.stack_offsets
   }
 
   pub fn type_by_name(&self, name: &String) -> Option<DataType> {
@@ -257,26 +341,20 @@ impl Interpreter {
   }
 
   pub fn typedef_by_name(&self, name: &String) -> Option<DataType> {
-    for scope in self.type_defs.last().unwrap().iter().rev() {
+    for scope in self.type_defs.iter().rev() {
       if let Some(ty) = scope.get(name) {
         return Some(ty.clone());
       }
     }
 
-    if let Some(ty) = self.type_defs[0][0].get(name) {
+    if let Some(ty) = self.get_root_scopes().get(name) {
       return Some(ty.clone());
     }
     None
   }
 
   pub fn set_typedef(&mut self, name: &String, ty: DataType) {
-    self
-      .type_defs
-      .last_mut()
-      .unwrap()
-      .last_mut()
-      .unwrap()
-      .insert(name.clone(), ty);
+    self.type_defs.last_mut().unwrap().insert(name.clone(), ty);
   }
 
   pub fn offset_by_name(&self, name: &String) -> Option<usize> {
@@ -415,7 +493,7 @@ impl Interpreter {
         if key_ty == DataType::None || val_ty == DataType::None {
           return Err(BuildError::TypeNotInferable(loc.clone()));
         }
-        Ok(DataType::Map(Box::new(key_ty), Box::new(val_ty)))
+        Ok(Interpreter::build_map_type(&key_ty, &val_ty))
       }
       AST::ArrayLiteral(vals, loc) => {
         let mut vals_ty = vec![];
@@ -426,7 +504,7 @@ impl Interpreter {
         if ty == DataType::None {
           return Err(BuildError::TypeNotInferable(loc.clone()));
         }
-        Ok(DataType::Array(Box::new(ty)))
+        Ok(Interpreter::build_array_type(&ty))
       }
       AST::BinOp(first, op, second, loc) => {
         let first = self.resolve_type(first)?;
@@ -434,7 +512,7 @@ impl Interpreter {
         if op.is_comparison() {
           return Ok(DataType::Bool);
         }
-        if first.is_of(&second) {
+        if first.satisfies(&second) {
           return Ok(first);
         }
         Err(BuildError::ParameterTypeMismatch(
@@ -459,6 +537,12 @@ impl Interpreter {
     if first == second {
       return first.clone();
     }
+    if first == &DataType::Unresolved {
+      return second.clone();
+    }
+    if second == &DataType::Unresolved {
+      return first.clone();
+    }
     if let DataType::Struct(first_ty) = first {
       if let DataType::Struct(second_ty) = second {
         let mut fields = HashMap::new();
@@ -466,9 +550,6 @@ impl Interpreter {
           if let Some(field_type) = second_ty.fields.get(field_name) {
             fields.insert(field_name.clone(), field_type.clone());
           }
-        }
-        if fields.len() == 0 {
-          return DataType::None;
         }
         return DataType::Struct(StructType {
           name: first_ty.name.clone(),
@@ -542,68 +623,50 @@ impl Interpreter {
   fn set_data_offset(&mut self, name: &str, offset: usize) {
     let last = self.stack_offsets.len() - 1;
     let last_scope = &mut self.stack_offsets[last];
-    last_scope
-      .last_mut()
-      .unwrap()
-      .insert(name.to_string(), offset);
+    last_scope.insert(name.to_string(), offset);
   }
 
   fn get_stack_size(&self) -> usize {
-    return self.stack_sizes[self.stack_offsets.len() - 1];
+    return self.stack_sizes;
   }
 
   fn inc_stack_size(&mut self) -> usize {
-    let last = self.stack_offsets.len() - 1;
-    self.stack_sizes[last] += 1;
-    self.stack_sizes[last] - 1
+    self.stack_sizes += 1;
+    self.stack_sizes - 1
   }
 
-  fn pop_stack(&mut self) {
-    self.stack_offsets.pop();
-    self.stack_sizes.pop();
-    self.data_types.pop();
+  fn dec_stack_size(&mut self) -> usize {
+    self.stack_sizes -= 1;
+    self.stack_sizes
   }
 
   fn pop_scope(&mut self) {
-    let last = self.stack_sizes.len() - 1;
     let scope_vars = self.get_current_scope().len();
-    self.stack_sizes[last] -= scope_vars;
-    self.stack_offsets.last_mut().unwrap().pop();
-    self.data_types.last_mut().unwrap().pop();
-  }
-
-  fn add_stack(&mut self) {
-    self.stack_offsets.push(vec![HashMap::new()]);
-    self.stack_sizes.push(0);
-    self.data_types.push(vec![HashMap::new()]);
+    self.stack_sizes -= scope_vars;
+    self.stack_offsets.pop();
+    self.data_types.pop();
   }
 
   fn add_scope(&mut self) {
-    self.stack_offsets.last_mut().unwrap().push(HashMap::new());
-    self.data_types.last_mut().unwrap().push(HashMap::new());
+    self.stack_offsets.push(HashMap::new());
+    self.data_types.push(HashMap::new());
   }
 
   fn stack_add(&mut self, name: &str) -> usize {
     let last = self.stack_offsets.len() - 1;
     let last_scope = &self.stack_offsets[last];
-    let scope = last_scope.last().unwrap();
+    let scope = last_scope;
     if scope.contains_key(&name.to_string()) {
       return scope[&name.to_string()];
     }
     let offset = self.inc_stack_size();
-    self.stack_offsets[last]
-      .last_mut()
-      .unwrap()
-      .insert(name.to_string(), offset);
+    self.stack_offsets[last].insert(name.to_string(), offset);
     offset
   }
 
   fn set_data_type(&mut self, name: &String, ty: DataType) {
     let last = self.data_types.len() - 1;
-    self.data_types[last]
-      .last_mut()
-      .unwrap()
-      .insert(name.clone(), ty);
+    self.data_types[last].insert(name.clone(), ty);
   }
 
   fn push_fn_offset(&self, callee: &AST, reg: Register) -> Result<(Program, DataType), BuildError> {
@@ -737,10 +800,112 @@ impl Interpreter {
           program.append(&mut ret);
           program.push(Statement::Ret);
         }
-        self.pop_stack();
         return Ok(program);
       }
       _ => todo!(),
+    }
+  }
+
+  fn as_map_key(&mut self, ast: &AST) -> AST {
+    match ast {
+      AST::Variable(name, loc) => AST::StringLiteral(name.clone(), loc.clone()),
+      ast => ast.clone(),
+    }
+  }
+
+  fn build_param_pattern(
+    &mut self,
+    stmt: &AST,
+    val: usize,
+    ty: DataType,
+  ) -> Result<(Program, Vec<usize>), BuildError> {
+    match stmt {
+      AST::MapLiteral(map, _) => {
+        if let Some((key_ty, val_ty)) = Interpreter::as_map_key_val(&ty) {
+          let mut program = vec![];
+          let mut exits = vec![];
+          for (key, value) in map {
+            let key = &self.as_map_key(key);
+            let (mut key_prog, pat_ty) = self.build_value_to_reg(key, REG_A)?;
+            if !pat_ty.satisfies(&key_ty) {
+              return Err(BuildError::InvalidType(key.location()));
+            }
+            program.append(&mut key_prog);
+            program.push(Statement::CopyToReg {
+              reg: REG_B,
+              offset: val,
+            });
+            program.push(Statement::MapGet {
+              reg: REG_RETURN,
+              key: REG_A,
+              map: REG_B,
+            });
+            program.push(Statement::Push { reg: REG_RETURN });
+            let map_val = self.inc_stack_size();
+            let (mut value_prog, mut value_exits) =
+              self.build_param_pattern(value, map_val, val_ty.clone())?;
+            program.append(&mut value_prog);
+            exits.append(&mut value_exits);
+          }
+          Ok((program, exits))
+        } else {
+          Err(BuildError::InvalidType(stmt.location()))
+        }
+      }
+      AST::ArrayLiteral(array, _) => {
+        if let Some(val_ty) = Interpreter::as_array_val(&ty) {
+          let mut program = vec![];
+          let mut exits = vec![];
+          for (i, value) in array.iter().enumerate() {
+            program.push(Statement::SetIntReg(i as i64, REG_A));
+            program.push(Statement::CopyToReg {
+              reg: REG_B,
+              offset: val,
+            });
+            program.push(Statement::ArrayGet {
+              reg: REG_RETURN,
+              index: REG_A,
+              array: REG_B,
+            });
+            program.push(Statement::Push { reg: REG_RETURN });
+            let array_val = self.inc_stack_size();
+            let (mut value_prog, mut value_exits) =
+              self.build_param_pattern(value, array_val, val_ty.clone())?;
+            program.append(&mut value_prog);
+            exits.append(&mut value_exits);
+          }
+          Ok((program, exits))
+        } else {
+          Err(BuildError::InvalidType(stmt.location()))
+        }
+      }
+      ast => {
+        let mut program = vec![];
+        if let AST::Variable(name, loc) = ast {
+          let offset = self.stack_add(name);
+          self.set_data_type(name, ty);
+          program.push(Statement::CopyToReg { reg: REG_B, offset });
+          program.push(Statement::Push { reg: REG_B });
+          self.inc_stack_size();
+          return Ok((program, vec![]));
+        }
+        let (mut create, val_ty) = self.build_value_to_reg(ast, REG_RETURN)?;
+        program.append(&mut create);
+        if !val_ty.satisfies(&ty) {
+          return Err(BuildError::InvalidType(ast.location()));
+        }
+        program.push(Statement::CopyToReg {
+          reg: REG_B,
+          offset: val,
+        });
+        program.push(Statement::Op { op: BinOpType::Eq });
+        program.push(Statement::JmpIf {
+          reg: REG_RETURN,
+          offset: 0,
+        });
+        let offset = program.len() - 1;
+        Ok((program, vec![offset])) // TODO: Fix JmpIf offset
+      }
     }
   }
 
@@ -756,7 +921,7 @@ impl Interpreter {
     program.append(&mut lhs_program);
     program.push(Statement::Push { reg: REG_A });
     let (mut rhs_program, rhs_ty) = self.build_value_to_reg(rhs, REG_B)?;
-    if !rhs_ty.is_of(&lhs_ty) {
+    if !rhs_ty.satisfies(&lhs_ty) {
       return Err(BuildError::InvalidType(rhs.location()));
     }
     program.append(&mut rhs_program);
@@ -775,28 +940,42 @@ impl Interpreter {
     return Ok(program);
   }
 
+  fn add_generic_scope(&mut self, generic: &Vec<String>) {
+    self.add_scope();
+    for arg in generic.iter() {
+      let arg_type = DataType::Generic(arg.clone());
+      self.set_typedef(arg, arg_type);
+    }
+  }
+
   fn build_fn(&mut self, ast: &AST) -> Result<Program, BuildError> {
     let mut program = vec![];
     match ast {
-      AST::Function(name, generics, args, _, body, loc) => {
-        self.add_stack();
-        for gen in generics {
-          self.set_data_type(gen, DataType::Generic(gen.clone()));
-        }
-        for (i, (name, ty)) in args.iter().enumerate() {
-          if name.is_pattern() {
-            todo!();
-          } else if let AST::Variable(id, _) = name {
-            let ty = self.resolve_typedef(&ty)?;
-            self.set_data_type(id, ty);
-            self.stack_add(id);
+      AST::Function(name, generics, args, ret, body, loc) => {
+        let ty = self.build_fn_def(name.to_string(), generics, args, ret, body, loc.clone())?;
+        if let DataType::Function(fn_ty) = ty {
+          self.add_generic_scope(generics);
+          for (i, (name, ty)) in args.iter().enumerate() {
+            program.push(Statement::Push { reg: i as u8 });
+          }
+          for (i, (name, _)) in args.iter().enumerate() {
+            let ty = fn_ty.args[i].clone();
+            if name.is_pattern() {
+              let val = self.inc_stack_size();
+              program.append(&mut self.build_param_pattern(name, val, ty)?.0); // TODO: Fix JmpIf offset
+            } else if let AST::Variable(id, _) = name {
+              self.set_data_type(id, ty);
+              self.stack_add(id);
+            } else {
+              todo!();
+            }
+          }
+          if let AST::Block(body, _) = body.as_ref() {
+            program.append(&mut self.build_body(body)?)
           } else {
             todo!();
           }
-          program.push(Statement::Push { reg: i as u8 });
-        }
-        if let AST::Block(body, _) = body.as_ref() {
-          program.append(&mut self.build_body(body)?)
+          self.pop_scope();
         } else {
           todo!();
         }
@@ -813,7 +992,7 @@ impl Interpreter {
     let (mut program, ty) = self.build_value_to_reg(rhs, REG_RETURN)?;
     if let AST::Variable(name, _) = lhs {
       if let Some(full) = self.type_by_name(name) {
-        if !ty.is_of(&full) {
+        if !ty.satisfies(&full) {
           return Err(BuildError::InvalidType(lhs.location()));
         } else if full.is_const() {
           return Err(BuildError::ConstantReassignment(lhs.location()));
@@ -829,26 +1008,9 @@ impl Interpreter {
     Ok(program)
   }
 
-  pub fn resolve_pattern_type(&mut self, pattern: &AST) -> Result<DataType, BuildError> {
-    // Might be obsolete
-    if !pattern.is_pattern() {
-      return Err(BuildError::PatternExpectd(pattern.location()));
-    }
-    match pattern {
-      AST::IntLiteral(..) => Ok(DataType::Int),
-      AST::FloatLiteral(..) => Ok(DataType::Float),
-      AST::BoolLiteral(..) => Ok(DataType::Bool),
-      AST::StringLiteral(..) => Ok(DataType::String),
-      AST::MapLiteral(..) | AST::ArrayLiteral(..) | AST::StructLiteral(..) => {
-        self.resolve_type(&pattern)
-      }
-      _ => Err(BuildError::PatternExpectd(pattern.location())),
-    }
-  }
-
   pub fn resolve_parameter_type(&mut self, lhs: &AST, rhs: &AST) -> Result<DataType, BuildError> {
     if lhs.is_pattern() {
-      self.resolve_pattern_type(lhs)
+      Ok(DataType::Unresolved)
     } else {
       self.resolve_typedef(rhs)
     }
@@ -865,16 +1027,17 @@ impl Interpreter {
   ) -> Result<DataType, BuildError> {
     let mut parsed_args = Vec::new();
     if !generic.is_empty() {
-      self.add_scope(); // add generic resolved scope
-      for arg in generic.iter() {
-        let arg_type = DataType::Generic(arg.clone());
-        self.set_typedef(arg, arg_type);
-      }
+      self.add_generic_scope(generic); // add generic resolved scope
     }
     for (lhs, rhs) in args {
       parsed_args.push(self.resolve_parameter_type(&lhs, &rhs)?);
     }
-    let ret = self.resolve_typedef(ret)?;
+
+    let ret = match ret {
+      AST::None(..) => DataType::None,
+      ret => self.resolve_typedef(ret)?,
+    };
+
     let current = self.type_by_name(&name);
     if let Some(current) = current {
       if let DataType::Function(current) = current {
@@ -927,30 +1090,35 @@ mod tests {
     let v = |s: &str| AST::Variable(s.to_string(), l());
     /*
      type i = int
-     type f = float
      type b = bool
+     type f = float
      type s = string
      fn e(a: i, {a: 1}): string{}
+     fn e(a: i, b: map:[s, i]): string{}
     */
     let ast = AST::Block(vec![
-      AST::Initialize(AssignType::Type, Box::new(v("a")), Box::new(v("int")), l()),
+      AST::Initialize(AssignType::Type, Box::new(v("i")), Box::new(v("int")), l()),
       AST::Initialize(AssignType::Type, Box::new(v("b")), Box::new(v("bool")), l()),
-      AST::Initialize(AssignType::Type, Box::new(v("c")), Box::new(v("float")), l()),
-      AST::Initialize(AssignType::Type, Box::new(v("d")), Box::new(v("string")), l()),
+      AST::Initialize(AssignType::Type, Box::new(v("f")), Box::new(v("float")), l()),
+      AST::Initialize(AssignType::Type, Box::new(v("s")), Box::new(v("string")), l()),
       AST::Function("e".to_string(), vec![], vec![(v("a"), v("int")), (
                 AST::MapLiteral(vec![(v("a"), AST::IntLiteral(1, l()))], l()), AST::None(l()))],
-                Box::new(v("string")), Box::new(AST::Block(vec![], l())), l())
+                Box::new(v("string")), Box::new(AST::Block(vec![], l())), l()),
+                
+      AST::Function("e".to_string(), vec![], vec![(v("a"), v("int")), (v("b"),
+        AST::GenericIdentifier(Box::new(v("map")), vec![v("s"), v("i")], l()))],
+                Box::new(v("string")), Box::new(AST::Block(vec![], l())), l()),
     ], l());
 
     let mut interpreter = Interpreter::new(ast);
     interpreter.build_root_types().unwrap();
-    assert_eq!(interpreter.typedef_by_name(&"a".to_string()), Some(DataType::Int));
+    assert_eq!(interpreter.typedef_by_name(&"i".to_string()), Some(DataType::Int));
     assert_eq!(interpreter.typedef_by_name(&"b".to_string()), Some(DataType::Bool));
-    assert_eq!(interpreter.typedef_by_name(&"c".to_string()), Some(DataType::Float));
-    assert_eq!(interpreter.typedef_by_name(&"d".to_string()), Some(DataType::String));
+    assert_eq!(interpreter.typedef_by_name(&"f".to_string()), Some(DataType::Float));
+    assert_eq!(interpreter.typedef_by_name(&"s".to_string()), Some(DataType::String));
     assert_eq!(interpreter.type_by_name(&"e".to_string()), Some(DataType::Function(Box::new(FunctionDataType {
       name: "e".to_string(),
-      args: vec![DataType::Int, DataType::Map(Box::new(DataType::String), Box::new(DataType::Int))],
+      args: vec![DataType::Int, Interpreter::build_map_type(&DataType::String, &DataType::Int)],
       ret: DataType::String,
       is_generic: false,
       generic_types: vec![],
@@ -1040,13 +1208,18 @@ mod tests {
     */
     let ast = AST::Block(vec![
       AST::Function("e".to_string(), vec![], vec![(v("a"), v("int")), (v("b"), v("int"))],
-                Box::new(v("int")), Box::new(AST::Block(vec![
-                  AST::Return(
-                    Some(
-                      Box::new(AST::BinOp(Box::new(v("a")),BinOpType::Add,Box::new(v("b")),l()))
-                    ), l()
-                  )
-                ], l())), l())
+        Box::new(v("int")), Box::new(AST::Block(vec![
+          AST::Return(
+            Some(
+              Box::new(
+                AST::BinOp(Box::new(v("a")),
+                BinOpType::Add,
+                Box::new(v("b")),l())
+              )
+            ), l()
+          )
+        ],
+      l())), l())
     ], l());
 
     let mut interpreter = Interpreter::new(ast);
@@ -1099,5 +1272,60 @@ mod tests {
 
     let mut interpreter = Interpreter::new(ast);
     println!("{:?}", interpreter.build().unwrap()); // Visual check iguess (^_^)
+  }
+
+  #[test]
+  fn test_build_pattern() {
+    let l = || lexer::CodeLocation::new("".to_string(), 0);
+    let v = |s: &str| AST::Variable(s.to_string(), l());
+    /*
+     fn e({a: [1, a]}) {
+     }
+     fn e(a: map:[string, array:[int]]) {
+     }
+    */
+    let ast = AST::Block(
+      vec![
+        AST::Function(
+          "e".to_string(),
+          vec![],
+          vec![(
+            AST::MapLiteral(
+              vec![(
+                v("a"),
+                AST::ArrayLiteral(vec![AST::IntLiteral(1, l()), v("a")], l()),
+              )],
+              l(),
+            ),
+            AST::None(l()),
+          )],
+          Box::new(AST::None(l())),
+          Box::new(AST::Block(vec![], l())),
+          l(),
+        ),
+        AST::Function(
+          "e".to_string(),
+          vec![],
+          vec![(
+            v("a"),
+            AST::GenericIdentifier(
+              Box::new(v("map")),
+              vec![
+                v("string"),
+                AST::GenericIdentifier(Box::new(v("array")), vec![v("int")], l()),
+              ],
+              l(),
+            ),
+          )],
+          Box::new(AST::None(l())),
+          Box::new(AST::Block(vec![], l())),
+          l(),
+        ),
+      ],
+      l(),
+    );
+
+    let mut interpreter = Interpreter::new(ast);
+    println!("{:#?}", interpreter.build().unwrap()); // Visual check iguess (^_^)
   }
 }
