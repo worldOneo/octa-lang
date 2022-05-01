@@ -17,6 +17,72 @@ pub struct StructType {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct FunctionDataType {
+  pub name: String,
+  pub args: Vec<DataType>,
+  pub ret: DataType,
+  pub generic_types: Vec<String>,
+  pub is_generic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Function {
+  pub data_type: FunctionDataType,
+  pub ast: AST,
+  pub matched_functions: Vec<Function>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionCompleteErr {
+  MultipleCompleteFunctions,
+  NoCompleteFunction,
+}
+
+impl Function {
+  pub fn is_complete(&self) -> bool {
+    if let AST::Function(_, _, args, ..) = &self.ast {
+      return args.iter()
+        .map(|(a, _)| a)
+        .all(|a| !a.is_pattern());
+    }
+    panic!("AST is no function");
+  }
+
+  pub fn join_function(&self, other: Function) -> Result<Function, FunctionCompleteErr> {
+    if self.is_complete() {
+      if other.is_complete() {
+        return Err(FunctionCompleteErr::MultipleCompleteFunctions);
+      } else {
+        let mut matches = self.matched_functions.clone();
+        matches.push(other);
+        return Ok(Function {
+          data_type: self.data_type.clone(),
+          ast: self.ast.clone(),
+          matched_functions: matches,
+        });
+      }
+    }
+    if other.is_complete() {
+      let mut matches = self.matched_functions.clone();
+      matches.push(self.clone());
+      Ok(Function {
+        data_type: other.data_type.clone(),
+        ast: other.ast.clone(),
+        matched_functions: matches,
+      })
+    } else {
+      let mut matches = self.matched_functions.clone();
+      matches.push(other.clone());
+      Ok(Function {
+        data_type: self.data_type.clone(),
+        ast: self.ast.clone(),
+        matched_functions: matches,
+      })
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum DataType {
   Unresolved,
   None,
@@ -29,15 +95,6 @@ pub enum DataType {
   Generic(String),
   GenericResolved(HashMap<String, DataType>, Box<DataType>),
   Const(Box<DataType>),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct FunctionDataType {
-  pub name: String,
-  pub args: Vec<DataType>,
-  pub ret: DataType,
-  pub generic_types: Vec<String>,
-  pub is_generic: bool,
 }
 
 impl DataType {
@@ -94,12 +151,15 @@ type Register = u8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+  Label {
+    name: usize,
+  },
   Jmp {
-    offset: isize,
+    label: usize,
   },
   JmpIf {
     reg: Register,
-    offset: isize,
+    label: usize,
   },
   Call,
   Ret,
@@ -122,7 +182,7 @@ pub enum Statement {
   SetFloatReg(f64, Register),
   SetBoolReg(bool, Register),
   SetStringReg(String, Register),
-  DelayedPushRootOffset {
+  DelayedPushOffset {
     reg: Register,
     element: String,
     loc: lexer::CodeLocation,
@@ -156,11 +216,13 @@ pub type Program = Vec<Statement>;
 
 pub struct Interpreter {
   pub syntax: AST,
-  pub stack_sizes: usize,
-  pub stack_offsets: Vec<HashMap<String, usize>>,
+  pub label_count: usize,
+  pub stack_sizes: Vec<usize>,
+  pub stack_functions: Vec<HashMap<String, (Function, usize)>>,
+  pub stack_offsets: Vec<Vec<HashMap<String, usize>>>,
   pub root_offsets: HashMap<String, usize>,
-  pub data_types: Vec<HashMap<String, DataType>>,
-  pub type_defs: Vec<HashMap<String, DataType>>,
+  pub data_types: Vec<Vec<HashMap<String, DataType>>>,
+  pub type_defs: Vec<Vec<HashMap<String, DataType>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -180,6 +242,7 @@ pub enum BuildError {
   GenericTypeMismatch(lexer::CodeLocation),
   TopLevelOperationExpected(lexer::CodeLocation),
   TopLevelBlockExpected(lexer::CodeLocation),
+  FunctionError(FunctionCompleteErr, lexer::CodeLocation),
 }
 
 pub fn as_name(ast: &AST, loc: lexer::CodeLocation) -> Result<String, BuildError> {
@@ -216,18 +279,20 @@ pub fn args_match(
 impl Interpreter {
   pub fn new(syntax: AST) -> Interpreter {
     let mut interpreter = Interpreter {
+      label_count: 0,
       syntax,
-      stack_offsets: vec![HashMap::new()],
-      stack_sizes: 0,
-      data_types: vec![HashMap::new()],
+      stack_functions: vec![HashMap::new()],
+      stack_offsets: vec![vec![HashMap::new()]],
+      stack_sizes: vec![0],
+      data_types: vec![vec![HashMap::new()]],
       root_offsets: HashMap::new(),
-      type_defs: vec![HashMap::new()],
+      type_defs: vec![vec![HashMap::new()]],
     };
-    interpreter.type_defs[0].insert("int".to_string(), DataType::Int);
-    interpreter.type_defs[0].insert("float".to_string(), DataType::Float);
-    interpreter.type_defs[0].insert("bool".to_string(), DataType::Bool);
-    interpreter.type_defs[0].insert("string".to_string(), DataType::String);
-    interpreter.type_defs[0].insert(
+    interpreter.type_defs[0][0].insert("int".to_string(), DataType::Int);
+    interpreter.type_defs[0][0].insert("float".to_string(), DataType::Float);
+    interpreter.type_defs[0][0].insert("bool".to_string(), DataType::Bool);
+    interpreter.type_defs[0][0].insert("string".to_string(), DataType::String);
+    interpreter.type_defs[0][0].insert(
       "map".to_string(),
       DataType::Struct(StructType {
         name: "map".to_string(),
@@ -236,7 +301,7 @@ impl Interpreter {
         is_generic: true,
       }),
     );
-    interpreter.type_defs[0].insert(
+    interpreter.type_defs[0][0].insert(
       "array".to_string(),
       DataType::Struct(StructType {
         name: "array".to_string(),
@@ -311,7 +376,7 @@ impl Interpreter {
   }
 
   pub fn get_visible_scopes(&self) -> &Vec<HashMap<String, DataType>> {
-    &self.data_types
+    &self.data_types[self.stack_sizes.len() - 1]
   }
 
   pub fn get_current_scope(&self) -> &HashMap<String, DataType> {
@@ -320,11 +385,11 @@ impl Interpreter {
   }
 
   pub fn get_root_scopes(&self) -> &HashMap<String, DataType> {
-    &self.data_types[0]
+    &self.data_types[0][0]
   }
 
   pub fn get_visible_offsets(&self) -> &Vec<HashMap<String, usize>> {
-    &self.stack_offsets
+    &self.stack_offsets[self.stack_sizes.len() - 1]
   }
 
   pub fn type_by_name(&self, name: &String) -> Option<DataType> {
@@ -341,20 +406,31 @@ impl Interpreter {
   }
 
   pub fn typedef_by_name(&self, name: &String) -> Option<DataType> {
-    for scope in self.type_defs.iter().rev() {
+    for scope in self.type_defs.last().unwrap().iter().rev() {
       if let Some(ty) = scope.get(name) {
         return Some(ty.clone());
       }
     }
 
-    if let Some(ty) = self.get_root_scopes().get(name) {
+    if let Some(ty) = self.type_defs[0][0].get(name) {
       return Some(ty.clone());
     }
     None
   }
 
   pub fn set_typedef(&mut self, name: &String, ty: DataType) {
-    self.type_defs.last_mut().unwrap().insert(name.clone(), ty);
+    self
+      .type_defs
+      .last_mut()
+      .unwrap()
+      .last_mut()
+      .unwrap()
+      .insert(name.clone(), ty);
+  }
+
+  fn create_label(&mut self) -> usize {
+    self.label_count += 1;
+    self.label_count
   }
 
   pub fn offset_by_name(&self, name: &String) -> Option<usize> {
@@ -598,18 +674,11 @@ impl Interpreter {
     self.build_root_types()?;
     let syntax = &self.syntax.clone();
     let mut program = vec![];
-    match syntax {
-      AST::Block(definitions, _) => {
-        for definition in definitions {
-          program.append(&mut self.build_statement(definition)?);
-        }
-      }
-      _ => todo!(),
-    }
+    program.append(&mut self.build_statement(syntax)?);
 
     for i in 0..program.len() {
       let stmnt = &program[i];
-      if let Statement::DelayedPushRootOffset { reg, element, loc } = stmnt {
+      if let Statement::DelayedPushOffset { reg, element, loc } = stmnt {
         if self.root_offsets.contains_key(element) {
           program[i] = Statement::SetIntReg(self.root_offsets[element] as i64, *reg);
         } else {
@@ -623,50 +692,85 @@ impl Interpreter {
   fn set_data_offset(&mut self, name: &str, offset: usize) {
     let last = self.stack_offsets.len() - 1;
     let last_scope = &mut self.stack_offsets[last];
-    last_scope.insert(name.to_string(), offset);
+    last_scope
+      .last_mut()
+      .unwrap()
+      .insert(name.to_string(), offset);
   }
 
   fn get_stack_size(&self) -> usize {
-    return self.stack_sizes;
+    return self.stack_sizes[self.stack_offsets.len() - 1];
   }
 
   fn inc_stack_size(&mut self) -> usize {
-    self.stack_sizes += 1;
-    self.stack_sizes - 1
+    let last = self.stack_offsets.len() - 1;
+    self.stack_sizes[last] += 1;
+    self.stack_sizes[last] - 1
   }
 
-  fn dec_stack_size(&mut self) -> usize {
-    self.stack_sizes -= 1;
-    self.stack_sizes
-  }
-
-  fn pop_scope(&mut self) {
-    let scope_vars = self.get_current_scope().len();
-    self.stack_sizes -= scope_vars;
+  fn pop_stack(&mut self) {
+    self.stack_functions.pop();
     self.stack_offsets.pop();
+    self.stack_sizes.pop();
     self.data_types.pop();
   }
 
+  fn pop_scope(&mut self) {
+    let last = self.stack_sizes.len() - 1;
+    let scope_vars = self.get_current_scope().len();
+    self.stack_sizes[last] -= scope_vars;
+    self.stack_offsets.last_mut().unwrap().pop();
+    self.data_types.last_mut().unwrap().pop();
+  }
+
+  fn add_stack(&mut self) {
+    self.stack_functions.push(HashMap::new());
+    self.stack_offsets.push(vec![HashMap::new()]);
+    self.stack_sizes.push(0);
+    self.data_types.push(vec![HashMap::new()]);
+  }
+
   fn add_scope(&mut self) {
-    self.stack_offsets.push(HashMap::new());
-    self.data_types.push(HashMap::new());
+    self.stack_offsets.last_mut().unwrap().push(HashMap::new());
+    self.data_types.last_mut().unwrap().push(HashMap::new());
   }
 
   fn stack_add(&mut self, name: &str) -> usize {
     let last = self.stack_offsets.len() - 1;
     let last_scope = &self.stack_offsets[last];
-    let scope = last_scope;
+    let scope = last_scope.last().unwrap();
     if scope.contains_key(&name.to_string()) {
       return scope[&name.to_string()];
     }
     let offset = self.inc_stack_size();
-    self.stack_offsets[last].insert(name.to_string(), offset);
+    self.stack_offsets[last]
+      .last_mut()
+      .unwrap()
+      .insert(name.to_string(), offset);
     offset
+  }
+
+  fn stack_add_function(&mut self, name: &str, other: Function) -> Result<(), BuildError> {
+    let last = self.stack_functions.len() - 1;
+    if let Some((function, label)) = self.stack_functions[last].remove(name) {
+      let loc = other.ast.location();
+      match function.join_function(other) {
+        Ok(f) => self.stack_functions[last].insert(name.to_string(), (f, label)),
+        Err(e) => return Err(BuildError::FunctionError(e, loc)),
+      };
+    } else {
+      let fn_label = self.create_label();
+      self.stack_functions[last].insert(name.to_string(), (other, fn_label));
+    }
+    Ok(())
   }
 
   fn set_data_type(&mut self, name: &String, ty: DataType) {
     let last = self.data_types.len() - 1;
-    self.data_types[last].insert(name.clone(), ty);
+    self.data_types[last]
+      .last_mut()
+      .unwrap()
+      .insert(name.clone(), ty);
   }
 
   fn push_fn_offset(&self, callee: &AST, reg: Register) -> Result<(Program, DataType), BuildError> {
@@ -678,7 +782,7 @@ impl Interpreter {
             if let Some(offset) = self.offset_by_name(name) {
               program.push(Statement::SetIntReg(offset as i64, reg));
             } else {
-              program.push(Statement::DelayedPushRootOffset {
+              program.push(Statement::DelayedPushOffset {
                 reg: REG_A,
                 element: name.to_string(),
                 loc: loc.clone(),
@@ -731,7 +835,7 @@ impl Interpreter {
           if let Some(offset) = self.offset_by_name(name) {
             program.push(Statement::CopyToReg { offset, reg });
           } else {
-            program.push(Statement::DelayedPushRootOffset {
+            program.push(Statement::DelayedPushOffset {
               reg,
               element: name.to_string(),
               loc: value.location(),
@@ -802,6 +906,7 @@ impl Interpreter {
         }
         return Ok(program);
       }
+      AST::Block(block, _) => self.build_body(block),
       _ => todo!(),
     }
   }
@@ -818,12 +923,12 @@ impl Interpreter {
     stmt: &AST,
     val: usize,
     ty: DataType,
-  ) -> Result<(Program, Vec<usize>), BuildError> {
+    skip: usize,
+  ) -> Result<Program, BuildError> {
     match stmt {
       AST::MapLiteral(map, _) => {
         if let Some((key_ty, val_ty)) = Interpreter::as_map_key_val(&ty) {
           let mut program = vec![];
-          let mut exits = vec![];
           for (key, value) in map {
             let key = &self.as_map_key(key);
             let (mut key_prog, pat_ty) = self.build_value_to_reg(key, REG_A)?;
@@ -842,12 +947,10 @@ impl Interpreter {
             });
             program.push(Statement::Push { reg: REG_RETURN });
             let map_val = self.inc_stack_size();
-            let (mut value_prog, mut value_exits) =
-              self.build_param_pattern(value, map_val, val_ty.clone())?;
+            let mut value_prog = self.build_param_pattern(value, map_val, val_ty.clone(), skip)?;
             program.append(&mut value_prog);
-            exits.append(&mut value_exits);
           }
-          Ok((program, exits))
+          Ok(program)
         } else {
           Err(BuildError::InvalidType(stmt.location()))
         }
@@ -855,7 +958,6 @@ impl Interpreter {
       AST::ArrayLiteral(array, _) => {
         if let Some(val_ty) = Interpreter::as_array_val(&ty) {
           let mut program = vec![];
-          let mut exits = vec![];
           for (i, value) in array.iter().enumerate() {
             program.push(Statement::SetIntReg(i as i64, REG_A));
             program.push(Statement::CopyToReg {
@@ -869,12 +971,11 @@ impl Interpreter {
             });
             program.push(Statement::Push { reg: REG_RETURN });
             let array_val = self.inc_stack_size();
-            let (mut value_prog, mut value_exits) =
-              self.build_param_pattern(value, array_val, val_ty.clone())?;
+            let mut value_prog =
+              self.build_param_pattern(value, array_val, val_ty.clone(), skip)?;
             program.append(&mut value_prog);
-            exits.append(&mut value_exits);
           }
-          Ok((program, exits))
+          Ok(program)
         } else {
           Err(BuildError::InvalidType(stmt.location()))
         }
@@ -887,9 +988,9 @@ impl Interpreter {
           program.push(Statement::CopyToReg { reg: REG_B, offset });
           program.push(Statement::Push { reg: REG_B });
           self.inc_stack_size();
-          return Ok((program, vec![]));
+          return Ok(program);
         }
-        let (mut create, val_ty) = self.build_value_to_reg(ast, REG_RETURN)?;
+        let (mut create, val_ty) = self.build_value_to_reg(ast, REG_A)?;
         program.append(&mut create);
         if !val_ty.satisfies(&ty) {
           return Err(BuildError::InvalidType(ast.location()));
@@ -901,10 +1002,9 @@ impl Interpreter {
         program.push(Statement::Op { op: BinOpType::Eq });
         program.push(Statement::JmpIf {
           reg: REG_RETURN,
-          offset: 0,
+          label: skip,
         });
-        let offset = program.len() - 1;
-        Ok((program, vec![offset])) // TODO: Fix JmpIf offset
+        Ok(program)
       }
     }
   }
@@ -937,6 +1037,11 @@ impl Interpreter {
     for stmt in body {
       program.append(&mut self.build_statement(stmt)?);
     }
+    let functions = self.stack_functions.pop().unwrap();
+    let functions = functions.values();
+    for (function, _) in functions {
+      program.append(&mut self.build_patterned_function(function)?);
+    }
     return Ok(program);
   }
 
@@ -948,21 +1053,29 @@ impl Interpreter {
     }
   }
 
-  fn build_fn(&mut self, ast: &AST) -> Result<Program, BuildError> {
+  fn build_patterned_function(&mut self, func: &Function) -> Result<Program, BuildError> {
+    if !func.is_complete() {
+      return Err(BuildError::FunctionError(
+        FunctionCompleteErr::NoCompleteFunction,
+        func.ast.location(),
+      ));
+    }
     let mut program = vec![];
-    match ast {
-      AST::Function(name, generics, args, ret, body, loc) => {
-        let ty = self.build_fn_def(name.to_string(), generics, args, ret, body, loc.clone())?;
-        if let DataType::Function(fn_ty) = ty {
-          self.add_generic_scope(generics);
-          for (i, (name, ty)) in args.iter().enumerate() {
-            program.push(Statement::Push { reg: i as u8 });
-          }
+    if let AST::Function(name, generics, args, ret, body, loc) = &func.ast {
+      self.add_stack();
+      self.add_generic_scope(&generics);
+      for (i, _) in args.iter().enumerate() {
+        program.push(Statement::Push { reg: i as u8 });
+      }
+      let skip = self.create_label();
+      for pattern in &func.matched_functions {
+        if let AST::Function(_, _, args, ..) = &pattern.ast {
           for (i, (name, _)) in args.iter().enumerate() {
-            let ty = fn_ty.args[i].clone();
+            let ty = func.data_type.args[i].clone();
             if name.is_pattern() {
               let val = self.inc_stack_size();
-              program.append(&mut self.build_param_pattern(name, val, ty)?.0); // TODO: Fix JmpIf offset
+              let mut pattern_program = self.build_param_pattern(name, val, ty, skip)?;
+              program.append(&mut pattern_program);
             } else if let AST::Variable(id, _) = name {
               self.set_data_type(id, ty);
               self.stack_add(id);
@@ -970,12 +1083,33 @@ impl Interpreter {
               todo!();
             }
           }
-          if let AST::Block(body, _) = body.as_ref() {
-            program.append(&mut self.build_body(body)?)
-          } else {
-            todo!();
-          }
-          self.pop_scope();
+          let mut body_program = self.build_statement(body.as_ref())?;
+          program.append(&mut body_program);
+          program.push(Statement::Label { name: skip });
+        } else {
+          todo!();
+        }
+        self.pop_scope();
+        self.pop_stack();
+      }
+    }
+    Ok(program)
+  }
+
+  fn build_fn(&mut self, ast: &AST) -> Result<Program, BuildError> {
+    let program = vec![];
+    match ast {
+      AST::Function(name, generics, args, ret, body, loc) => {
+        let ty = self.build_fn_def(name.to_string(), &generics, &args, &ret, &body, loc.clone())?;
+        if let DataType::Function(fn_ty) = ty {
+          self.stack_add_function(
+            &name,
+            Function {
+              data_type: *fn_ty.clone(),
+              ast: ast.clone(),
+              matched_functions: vec![],
+            },
+          )?;
         } else {
           todo!();
         }
@@ -1026,6 +1160,7 @@ impl Interpreter {
     loc: lexer::CodeLocation,
   ) -> Result<DataType, BuildError> {
     let mut parsed_args = Vec::new();
+    self.add_stack();
     if !generic.is_empty() {
       self.add_generic_scope(generic); // add generic resolved scope
     }
@@ -1039,6 +1174,7 @@ impl Interpreter {
     };
 
     let current = self.type_by_name(&name);
+
     if let Some(current) = current {
       if let DataType::Function(current) = current {
         if current.args.len() != parsed_args.len() {
@@ -1067,6 +1203,7 @@ impl Interpreter {
     if !generic.is_empty() {
       self.pop_scope(); // pop generic resolved scope
     }
+    self.pop_stack();
     Ok(DataType::Function(Box::new(FunctionDataType {
       name,
       args: parsed_args,
@@ -1326,6 +1463,6 @@ mod tests {
     );
 
     let mut interpreter = Interpreter::new(ast);
-    println!("{:#?}", interpreter.build().unwrap()); // Visual check iguess (^_^)
+    println!("{:?}", interpreter.build().unwrap()); // Visual check iguess (^_^)
   }
 }
