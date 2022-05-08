@@ -65,7 +65,7 @@ pub enum AST {
   BoolLiteral(bool, lexer::CodeLocation),
   ArrayLiteral(Vec<AST>, lexer::CodeLocation),
   MapLiteral(Vec<(AST, AST)>, lexer::CodeLocation),
-  StructLiteral(String, Vec<AST>, lexer::CodeLocation),
+  StructLiteral(String, Vec<(String, AST)>, lexer::CodeLocation),
   StructDefinition(String, Vec<String>, Vec<(String, AST)>, lexer::CodeLocation),
   Function(
     String,
@@ -136,7 +136,7 @@ impl AST {
         .map(|(a, _)| a)
         .chain(pairs.iter().map(|(_, b)| b))
         .collect::<Vec<_>>(),
-      AST::StructLiteral(_, elements, _) => elements.iter().collect::<Vec<_>>(),
+      AST::StructLiteral(_, elements, _) => elements.iter().map(|(_, a)| a).collect::<Vec<_>>(),
       AST::StructDefinition(_, _, elements, _) => {
         elements.iter().map(|(_, b)| b).collect::<Vec<_>>()
       }

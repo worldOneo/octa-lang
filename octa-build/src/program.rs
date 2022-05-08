@@ -11,7 +11,8 @@ pub struct StructField {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructType {
   pub name: String,
-  pub fields: HashMap<String, StructField>,
+  pub fields: HashMap<String, (usize, StructField)>,
+  pub sorted_fields: Vec<(String, StructField)>,
   pub generic_types: Vec<String>,
   pub is_generic: bool,
 }
@@ -41,9 +42,7 @@ pub enum FunctionCompleteErr {
 impl Function {
   pub fn is_complete(&self) -> bool {
     if let AST::Function(_, _, args, ..) = &self.ast {
-      return args.iter()
-        .map(|(a, _)| a)
-        .all(|a| !a.is_pattern());
+      return args.iter().map(|(a, _)| a).all(|a| !a.is_pattern());
     }
     panic!("AST is no function");
   }
@@ -110,7 +109,7 @@ impl DataType {
     if let DataType::Struct(inner) = self {
       if let DataType::Struct(other_inner) = other {
         return inner.fields.iter().all(|(name, ty)| {
-          other_inner.fields.contains_key(name) && other_inner.fields[name].ty.satisfies(&ty.ty)
+          other_inner.fields.contains_key(name) && other_inner.fields[name].1.ty.satisfies(&ty.1.ty)
         });
       }
     }
@@ -135,6 +134,13 @@ impl DataType {
       _ => false,
     }
   }
+
+  pub fn is_primitive(&self) -> bool {
+    match self {
+      DataType::Int | DataType::Float | DataType::Bool | DataType::String => true,
+      _ => false,
+    }
+  }
 }
 
 pub enum Literal {
@@ -150,7 +156,15 @@ pub enum Literal {
 type Register = u8;
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ProgramData {
+  pub duck_table: Vec<Vec<usize>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+  Data {
+    data: Box<ProgramData>,
+  },
   Label {
     name: usize,
   },
@@ -167,7 +181,10 @@ pub enum Statement {
     reg: Register,
   },
   Swap,
-  Dupe,
+  Dupe {
+    reg: Register,
+    val: Register,
+  },
   Pop {
     reg: Register,
   },
@@ -182,11 +199,6 @@ pub enum Statement {
   SetFloatReg(f64, Register),
   SetBoolReg(bool, Register),
   SetStringReg(String, Register),
-  DelayedPushOffset {
-    reg: Register,
-    element: String,
-    loc: lexer::CodeLocation,
-  },
   CopyToReg {
     reg: Register,
     offset: usize,
@@ -205,17 +217,42 @@ pub enum Statement {
     index: Register,
     array: Register,
   },
+  MapInit {
+    reg: Register,
+  },
+  ArrayInit {
+    reg: Register,
+    size: usize,
+  },
+  StructInit {
+    reg: Register,
+    size: usize,
+  },
+  DuckGet {
+    reg: Register,
+    ptr: Register,
+    index: usize,
+  },
+  DuckConv {
+    reg: Register,
+    ptr: Register,
+    index: usize,
+  },
+  CallNative {
+    name: String,
+  },
 }
 const REG_A: Register = 0;
 const REG_B: Register = 1;
 const REG_C: Register = 2;
 const REG_RETURN: Register = 255;
-const REG_ESP: Register = REG_RETURN - 1;
 
 pub type Program = Vec<Statement>;
 
 pub struct Interpreter {
   pub syntax: AST,
+  pub duck_table_index: HashMap<Vec<usize>, usize>,
+  pub duck_tables: Vec<Vec<usize>>,
   pub label_count: usize,
   pub stack_sizes: Vec<usize>,
   pub stack_functions: Vec<HashMap<String, (Function, usize)>>,
@@ -281,6 +318,8 @@ impl Interpreter {
     let mut interpreter = Interpreter {
       label_count: 0,
       syntax,
+      duck_table_index: HashMap::new(),
+      duck_tables: Vec::new(),
       stack_functions: vec![HashMap::new()],
       stack_offsets: vec![vec![HashMap::new()]],
       stack_sizes: vec![0],
@@ -297,6 +336,7 @@ impl Interpreter {
       DataType::Struct(StructType {
         name: "map".to_string(),
         fields: HashMap::new(),
+        sorted_fields: vec![],
         generic_types: vec!["K".to_string(), "V".to_string()],
         is_generic: true,
       }),
@@ -306,6 +346,7 @@ impl Interpreter {
       DataType::Struct(StructType {
         name: "array".to_string(),
         fields: HashMap::new(),
+        sorted_fields: vec![],
         generic_types: vec!["T".to_string()],
         is_generic: true,
       }),
@@ -322,6 +363,7 @@ impl Interpreter {
       Box::new(DataType::Struct(StructType {
         name: "map".to_string(),
         fields: HashMap::new(),
+        sorted_fields: vec![],
         generic_types: vec!["K".to_string(), "V".to_string()],
         is_generic: true,
       })),
@@ -369,6 +411,7 @@ impl Interpreter {
       Box::new(DataType::Struct(StructType {
         name: "array".to_string(),
         fields: HashMap::new(),
+        sorted_fields: vec![],
         generic_types: vec!["T".to_string()],
         is_generic: true,
       })),
@@ -455,7 +498,7 @@ impl Interpreter {
     match first {
       DataType::Struct(struct_type) => {
         if let Some(ty) = struct_type.fields.get(second) {
-          return Ok(ty.ty.clone());
+          return Ok(ty.1.ty.clone());
         }
         Err(BuildError::TypeHasNoMember(loc))
       }
@@ -470,14 +513,25 @@ impl Interpreter {
         .ok_or(BuildError::InvalidType(loc.clone())),
       AST::StructDefinition(name, generics, fields, loc) => {
         let mut type_fields = HashMap::new();
-        for field in fields {
+        let mut fields = fields.clone();
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        for (idx, field) in fields.iter().enumerate() {
           let field_name = field.0.clone();
           let field_type = self.resolve_typedef(&field.1)?;
-          type_fields.insert(field_name, StructField { ty: field_type });
+          type_fields.insert(field_name, (idx, StructField { ty: field_type }));
         }
+
+        let mut sorted_fields = type_fields.clone().into_iter().collect::<Vec<_>>();
+        sorted_fields.sort_by(|(name, _), (name2, _)| name.cmp(&name2));
+        let sorted_fields = sorted_fields
+          .into_iter()
+          .map(|(name, (_, field))| (name, field))
+          .collect::<Vec<_>>();
+
         Ok(DataType::Struct(StructType {
           name: name.clone(),
           fields: type_fields,
+          sorted_fields: sorted_fields,
           generic_types: generics.clone(),
           is_generic: !generics.is_empty(),
         }))
@@ -622,14 +676,17 @@ impl Interpreter {
     if let DataType::Struct(first_ty) = first {
       if let DataType::Struct(second_ty) = second {
         let mut fields = HashMap::new();
+        let mut sorted_fields = vec![];
         for (field_name, _) in &first_ty.fields {
           if let Some(field_type) = second_ty.fields.get(field_name) {
             fields.insert(field_name.clone(), field_type.clone());
+            sorted_fields.push((field_name.clone(), field_type.1.clone()));
           }
         }
         return DataType::Struct(StructType {
           name: first_ty.name.clone(),
           fields,
+          sorted_fields,
           generic_types: vec![],
           is_generic: false,
         });
@@ -675,17 +732,6 @@ impl Interpreter {
     let syntax = &self.syntax.clone();
     let mut program = vec![];
     program.append(&mut self.build_statement(syntax)?);
-
-    for i in 0..program.len() {
-      let stmnt = &program[i];
-      if let Statement::DelayedPushOffset { reg, element, loc } = stmnt {
-        if self.root_offsets.contains_key(element) {
-          program[i] = Statement::SetIntReg(self.root_offsets[element] as i64, *reg);
-        } else {
-          return Err(BuildError::InvalidType(loc.clone()));
-        }
-      }
-    }
     return Ok(program);
   }
 
@@ -773,29 +819,8 @@ impl Interpreter {
       .insert(name.clone(), ty);
   }
 
-  fn push_fn_offset(&self, callee: &AST, reg: Register) -> Result<(Program, DataType), BuildError> {
-    match callee {
-      AST::Variable(name, loc) => {
-        if let Some(ty) = self.type_by_name(name) {
-          if let DataType::Function(func) = ty {
-            let mut program = vec![];
-            if let Some(offset) = self.offset_by_name(name) {
-              program.push(Statement::SetIntReg(offset as i64, reg));
-            } else {
-              program.push(Statement::DelayedPushOffset {
-                reg: REG_A,
-                element: name.to_string(),
-                loc: loc.clone(),
-              });
-            }
-            program.push(Statement::Push { reg: reg });
-            return Ok((program, func.ret));
-          }
-        }
-        Err(BuildError::InvalidType(loc.clone()))
-      }
-      _ => Err(BuildError::InvalidType(callee.location())),
-    }
+  fn get_fn_label(&self, callee: &AST) -> Result<usize, BuildError> {
+    todo!("Function labels");
   }
 
   fn build_value_to_reg(
@@ -823,11 +848,7 @@ impl Interpreter {
         program.push(Statement::SetBoolReg(*b, reg));
       }
       AST::Call(callee, args, _) => {
-        let mut offset = self.push_fn_offset(&callee, reg)?;
-        program.append(&mut offset.0);
-        if let DataType::Function(func) = offset.1 {
-          ty = func.ret;
-        }
+        (_, ty) = self.build_call(callee, args)?;
       }
       AST::Variable(name, _) => {
         if let Some(vty) = self.type_by_name(name) {
@@ -835,12 +856,7 @@ impl Interpreter {
           if let Some(offset) = self.offset_by_name(name) {
             program.push(Statement::CopyToReg { offset, reg });
           } else {
-            program.push(Statement::DelayedPushOffset {
-              reg,
-              element: name.to_string(),
-              loc: value.location(),
-            });
-            program.push(Statement::Pop { reg });
+            return Err(BuildError::InvalidType(value.location()));
           }
         } else {
           Err(BuildError::InvalidType(value.location()))?
@@ -858,6 +874,38 @@ impl Interpreter {
 
   fn build_value_to_ret(&mut self, value: &AST) -> Result<(Program, DataType), BuildError> {
     self.build_value_to_reg(value, REG_RETURN)
+  }
+
+  fn build_call(
+    &mut self,
+    callee: &AST,
+    args: &Vec<AST>,
+  ) -> Result<(Program, DataType), BuildError> {
+    if let DataType::Function(func) = self.resolve_type(callee)? {
+      let mut program = vec![];
+      let label = self.get_fn_label(&callee)?;
+      for i in 0..args.len() {
+        let arg = &args[i];
+        let (mut p, t) = self.build_value_to_reg(arg, i as Register)?;
+        program.append(&mut p);
+        program.append(&mut self.build_convert_type_to_reg(
+          i as Register,
+          i as Register,
+          &t,
+          &func.args[i],
+          args[i].location(),
+        )?);
+        program.push(Statement::Push { reg: i as Register });
+      }
+      for i in 0..args.len() {
+        program.push(Statement::Pop {
+          reg: (args.len() - i - 1) as Register,
+        });
+      }
+      program.push(Statement::Jmp { label });
+      return Ok((program, func.ret));
+    }
+    return Err(BuildError::InvalidType(callee.location()));
   }
 
   fn build_initialize(
@@ -1033,6 +1081,7 @@ impl Interpreter {
   }
 
   fn build_body(&mut self, body: &Vec<AST>) -> Result<Program, BuildError> {
+    // TODO: Pre determine jump labels
     let mut program = vec![];
     for stmt in body {
       program.append(&mut self.build_statement(stmt)?);
@@ -1068,7 +1117,9 @@ impl Interpreter {
         program.push(Statement::Push { reg: i as u8 });
       }
       let skip = self.create_label();
-      for pattern in &func.matched_functions {
+      let mut funcs = func.matched_functions.clone();
+      funcs.push(func.clone());
+      for pattern in &funcs {
         if let AST::Function(_, _, args, ..) = &pattern.ast {
           for (i, (name, _)) in args.iter().enumerate() {
             let ty = func.data_type.args[i].clone();
@@ -1083,15 +1134,17 @@ impl Interpreter {
               todo!();
             }
           }
-          let mut body_program = self.build_statement(body.as_ref())?;
-          program.append(&mut body_program);
-          program.push(Statement::Label { name: skip });
+          if pattern.is_complete() {
+            let mut body_program = self.build_statement(body.as_ref())?;
+            program.push(Statement::Label { name: skip });
+            program.append(&mut body_program);
+          }
         } else {
           todo!();
         }
-        self.pop_scope();
-        self.pop_stack();
       }
+      self.pop_scope();
+      self.pop_stack();
     }
     Ok(program)
   }
@@ -1119,9 +1172,159 @@ impl Interpreter {
     return Ok(program);
   }
 
+  // Duck typing
+  fn add_duck_table(&mut self, table: &Vec<usize>) -> usize {
+    if let Some(index) = self.duck_table_index.get(table) {
+      return *index;
+    }
+    let index = self.duck_tables.len();
+    self.duck_table_index.insert(table.clone(), index);
+    self.duck_tables.push(table.clone());
+    return index;
+  }
+
+  fn build_satisfaction_table(&mut self, reach: &DataType, duck: &DataType) -> Option<usize> {
+    if !duck.satisfies(reach) {
+      panic!("build_satisfaction_table: duck does not satisfy reach");
+    }
+    if let DataType::Struct(strct) = reach {
+      if let DataType::Struct(duck_strct) = duck {
+        let mut diff = vec![];
+        let other_idx: usize = 0;
+        let duck_fields = &duck_strct.sorted_fields;
+        let reach_fields = &strct.sorted_fields;
+        for (idx, field) in duck_fields.iter().enumerate() {
+          if let Some((name, duck_ty)) = reach_fields.get(other_idx) {
+            if &field.0 == name && (field.1).ty == duck_ty.ty {
+              diff.push(idx);
+              continue;
+            } else if &field.0 == name && (field.1).ty != duck_ty.ty {
+              return None;
+            }
+          }
+        }
+        return Some(self.add_duck_table(&diff));
+      }
+    }
+    return None;
+  }
+
+  fn build_struct_literal_to_reg(&mut self, ast: &AST) -> Result<(Program, DataType), BuildError> {
+    match ast {
+      AST::StructLiteral(name, fields, _) => {
+        if let Some(ty) = &self.type_by_name(name) {
+          if let DataType::Struct(struct_ty) = ty {
+            let mut program = vec![];
+            for (i, (name, field)) in fields.iter().enumerate() {
+              let (mut field_program, field_ty) = self.build_value_to_reg(field, i as u8)?;
+              program.append(&mut field_program);
+              if !field_ty.satisfies(&struct_ty.fields[name].1.ty) {
+                return Err(BuildError::InvalidType(field.location()));
+              }
+            }
+
+            program.push(Statement::Push { reg: REG_RETURN });
+            return Ok((program, ty.clone()));
+          } else {
+            todo!();
+          }
+        } else {
+          return Err(BuildError::InvalidType(ast.location()));
+        }
+      }
+      _ => todo!(),
+    };
+  }
+
+  fn build_empty_type_to_reg(
+    &mut self,
+    ty: &DataType,
+    reg: Register,
+  ) -> Result<Program, BuildError> {
+    match &ty {
+      DataType::Struct(strct) => {
+        let mut program = vec![];
+        if let Some(_) = Self::as_array_val(ty) {
+          program.push(Statement::ArrayInit { reg, size: 0 });
+          return Ok(program);
+        } else if let Some((_, _)) = Self::as_map_key_val(ty) {
+          program.push(Statement::MapInit { reg });
+          return Ok(program);
+        }
+        for (_, field) in strct.sorted_fields.iter().enumerate() {
+          program.append(&mut self.build_empty_type_to_reg(&field.1.ty, REG_A)?);
+          program.push(Statement::Push { reg: REG_A });
+        }
+        for i in 0..strct.fields.len() {
+          program.push(Statement::Pop { reg: i as u8 });
+        }
+
+        program.push(Statement::StructInit {
+          reg: reg,
+          size: strct.fields.len(),
+        });
+        return Ok(program);
+      }
+      DataType::Bool => {
+        return Ok(vec![Statement::SetBoolReg(false, reg)]);
+      }
+      DataType::Int => {
+        return Ok(vec![Statement::SetIntReg(0, reg)]);
+      }
+      DataType::Float => {
+        return Ok(vec![Statement::SetFloatReg(0.0, reg)]);
+      }
+      DataType::String => {
+        return Ok(vec![Statement::SetStringReg("".to_string(), reg)]);
+      }
+      _ => todo!(),
+    }
+  }
+
+  fn build_convert_type_to_reg(
+    &mut self,
+    val: Register,
+    reg: Register,
+    from: &DataType,
+    to: &DataType,
+    loc: lexer::CodeLocation,
+  ) -> Result<Program, BuildError> {
+    if !from.satisfies(to) {
+      return Err(BuildError::InvalidType(loc));
+    }
+    if from.is_primitive() {
+      return Ok(vec![Statement::Dupe { val, reg }]);
+    }
+    if from == to {
+      return Ok(vec![Statement::Dupe { val, reg }]);
+    }
+    if let Some(table) = self.build_satisfaction_table(from, to) {
+      return Ok(vec![Statement::DuckConv {
+        index: table,
+        ptr: val,
+        reg,
+      }]);
+    }
+    return Err(BuildError::InvalidType(loc));
+  }
+
   pub fn build_assign(&mut self, lhs: &AST, rhs: &AST) -> Result<Program, BuildError> {
     if lhs.is_pattern() {
-      todo!()
+      let mut program = vec![];
+      let (mut prog, ty) = self.build_value_to_ret(rhs)?;
+      program.append(&mut prog);
+      program.push(Statement::Push { reg: REG_RETURN });
+      let val = self.inc_stack_size();
+      let skip = self.create_label();
+      let pass = self.create_label();
+      let mut pattern_program = self.build_param_pattern(lhs, val, ty, skip)?;
+      program.append(&mut pattern_program);
+      program.push(Statement::Jmp { label: pass });
+      program.push(Statement::Label { name: skip });
+      // TODO: Stack return empty
+      program.push(Statement::Ret {});
+      program.push(Statement::Label { name: pass });
+      return Ok(program);
     }
     let (mut program, ty) = self.build_value_to_reg(rhs, REG_RETURN)?;
     if let AST::Variable(name, _) = lhs {

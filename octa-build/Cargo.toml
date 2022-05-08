@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 octa-parse = { path = "../octa-parse" }
 octa-lex = { path = "../octa-lex" }
+octa-vm = { path = "../octa-vm" }
