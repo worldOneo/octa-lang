@@ -48,6 +48,9 @@ impl Function {
   }
 
   pub fn join_function(&self, other: Function) -> Result<Function, FunctionCompleteErr> {
+    if self.ast == other.ast && self.data_type == other.data_type {
+      return Ok(self.clone());
+    }
     if self.is_complete() {
       if other.is_complete() {
         return Err(FunctionCompleteErr::MultipleCompleteFunctions);
@@ -175,7 +178,9 @@ pub enum Statement {
     reg: Register,
     label: usize,
   },
-  Call,
+  Call {
+    label: usize,
+  },
   Ret,
   Push {
     reg: Register,
@@ -257,7 +262,6 @@ pub struct Interpreter {
   pub stack_sizes: Vec<usize>,
   pub stack_functions: Vec<HashMap<String, (Function, usize)>>,
   pub stack_offsets: Vec<Vec<HashMap<String, usize>>>,
-  pub root_offsets: HashMap<String, usize>,
   pub data_types: Vec<Vec<HashMap<String, DataType>>>,
   pub type_defs: Vec<Vec<HashMap<String, DataType>>>,
 }
@@ -324,7 +328,6 @@ impl Interpreter {
       stack_offsets: vec![vec![HashMap::new()]],
       stack_sizes: vec![0],
       data_types: vec![vec![HashMap::new()]],
-      root_offsets: HashMap::new(),
       type_defs: vec![vec![HashMap::new()]],
     };
     interpreter.type_defs[0][0].insert("int".to_string(), DataType::Int);
@@ -481,10 +484,6 @@ impl Interpreter {
       if let Some(offset) = scope.get(name) {
         return Some(*offset);
       }
-    }
-
-    if let Some(offset) = self.root_offsets.get(name) {
-      return Some(*offset);
     }
     None
   }
@@ -701,34 +700,7 @@ impl Interpreter {
     })
   }
 
-  pub fn build_root_types(&mut self) -> Result<(), BuildError> {
-    let location = self.syntax.location();
-    let syntax = &self.syntax.clone();
-    match syntax {
-      AST::Block(definitions, loc) => {
-        for definition in definitions {
-          match definition {
-            AST::Initialize(AssignType::Type, name, ty, loc) => {
-              let ty = self.resolve_typedef(&ty)?;
-              let name = as_name(&name, loc.clone())?;
-              self.set_typedef(&name, ty);
-            }
-            AST::Function(name, generic, args, ret, body, loc) => {
-              let ty =
-                self.build_fn_def(name.clone(), &generic, &args, &ret, &body, loc.clone())?;
-              self.set_data_type(name, ty);
-            }
-            _ => Err(BuildError::TopLevelOperationExpected(definition.location()))?,
-          }
-        }
-        Ok(())
-      }
-      _ => Err(BuildError::TopLevelOperationExpected(location))?,
-    }
-  }
-
   pub fn build(&mut self) -> Result<Program, BuildError> {
-    self.build_root_types()?;
     let syntax = &self.syntax.clone();
     let mut program = vec![];
     program.append(&mut self.build_statement(syntax)?);
@@ -820,7 +792,14 @@ impl Interpreter {
   }
 
   fn get_fn_label(&self, callee: &AST) -> Result<usize, BuildError> {
-    todo!("Function labels");
+    if let AST::Variable(name, _) = callee {
+      for stack in self.stack_functions.iter().rev() {
+        if let Some((_, label)) = stack.get(name) {
+          return Ok(*label);
+        }
+      }
+    }
+    return Err(BuildError::InvalidCall(callee.location()));
   }
 
   fn build_value_to_reg(
@@ -902,7 +881,7 @@ impl Interpreter {
           reg: (args.len() - i - 1) as Register,
         });
       }
-      program.push(Statement::Jmp { label });
+      program.push(Statement::Call { label });
       return Ok((program, func.ret));
     }
     return Err(BuildError::InvalidType(callee.location()));
@@ -914,6 +893,9 @@ impl Interpreter {
     lhs: &AST,
     rhs: &AST,
   ) -> Result<Program, BuildError> {
+    if assign_type == parser::AssignType::Type {
+      return Ok(vec![]);
+    }
     if lhs.is_pattern() {
       return todo!();
     }
@@ -934,7 +916,7 @@ impl Interpreter {
       });
       return Ok(program);
     }
-    return todo!();
+    todo!();
   }
 
   fn build_statement(&mut self, stmt: &AST) -> Result<Program, BuildError> {
@@ -944,7 +926,7 @@ impl Interpreter {
         return Ok(program);
       }
       AST::Assign(lhs, rhs, _) => self.build_assign(lhs, rhs),
-      AST::Function(..) => self.build_fn(stmt),
+      AST::Function(..) => Ok(vec![]), // self.build_fn(stmt), pre collected later build
       AST::Return(value, _) => {
         let mut program = vec![];
         if let Some(value) = value {
@@ -1080,15 +1062,40 @@ impl Interpreter {
     return Ok((program, lhs_ty));
   }
 
+  fn collect_referencable_labels(&mut self, ast: &Vec<AST>) -> Result<(), BuildError> {
+    for stmt in ast {
+      match stmt {
+        AST::Initialize(AssignType::Type, name, ty, loc) => {
+          let ty = self.resolve_typedef(&ty)?;
+          let name = as_name(&name, loc.clone())?;
+          self.set_typedef(&name, ty);
+        }
+        AST::Function(name, generic, args, ret, body, loc) => {
+          let ty = self.build_fn_def(name.clone(), &generic, &args, &ret, &body, loc.clone())?;
+          if let DataType::Function(_) = &ty {
+            let (name, f) = self.build_fn(stmt)?;
+            self.set_data_type(&name, ty);
+            self.stack_add_function(&name, f)?;
+          } else {
+            panic!("build_fn_def didn't return a function")
+          }
+        }
+        _ => {}
+      }
+    }
+    Ok(())
+  }
+
   fn build_body(&mut self, body: &Vec<AST>) -> Result<Program, BuildError> {
-    // TODO: Pre determine jump labels
+    self.collect_referencable_labels(body)?;
     let mut program = vec![];
     for stmt in body {
       program.append(&mut self.build_statement(stmt)?);
     }
     let functions = self.stack_functions.pop().unwrap();
     let functions = functions.values();
-    for (function, _) in functions {
+    for (function, label) in functions {
+      program.push(Statement::Label { name: *label });
       program.append(&mut self.build_patterned_function(function)?);
     }
     return Ok(program);
@@ -1149,27 +1156,25 @@ impl Interpreter {
     Ok(program)
   }
 
-  fn build_fn(&mut self, ast: &AST) -> Result<Program, BuildError> {
-    let program = vec![];
+  fn build_fn(&mut self, ast: &AST) -> Result<(String, Function), BuildError> {
     match ast {
       AST::Function(name, generics, args, ret, body, loc) => {
         let ty = self.build_fn_def(name.to_string(), &generics, &args, &ret, &body, loc.clone())?;
         if let DataType::Function(fn_ty) = ty {
-          self.stack_add_function(
-            &name,
+          return Ok((
+            name.into(),
             Function {
               data_type: *fn_ty.clone(),
               ast: ast.clone(),
               matched_functions: vec![],
             },
-          )?;
+          ));
         } else {
           todo!();
         }
       }
-      _ => todo!(),
-    };
-    return Ok(program);
+      _ => todo!("build_fn ast is not a function"),
+    }
   }
 
   // Duck typing
@@ -1451,7 +1456,7 @@ mod tests {
     ], l());
 
     let mut interpreter = Interpreter::new(ast);
-    interpreter.build_root_types().unwrap();
+    interpreter.build().unwrap();
     assert_eq!(interpreter.typedef_by_name(&"i".to_string()), Some(DataType::Int));
     assert_eq!(interpreter.typedef_by_name(&"b".to_string()), Some(DataType::Bool));
     assert_eq!(interpreter.typedef_by_name(&"f".to_string()), Some(DataType::Float));
@@ -1480,7 +1485,7 @@ mod tests {
     ], l());
 
     let mut interpreter = Interpreter::new(ast);
-    interpreter.build_root_types().unwrap();
+    interpreter.build().unwrap();
     assert_eq!(interpreter.type_by_name(&"e".to_string()), Some(
       DataType::Function(Box::new(FunctionDataType {
         name: "e".to_string(),
@@ -1520,7 +1525,7 @@ mod tests {
     );
 
     let mut interpreter = Interpreter::new(ast);
-    interpreter.build_root_types().unwrap();
+    interpreter.build().unwrap();
     assert_eq!(
       interpreter.typedef_by_name(&"i".to_string()),
       Some(DataType::GenericResolved(
