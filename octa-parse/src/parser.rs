@@ -65,8 +65,8 @@ pub enum AST {
   BoolLiteral(bool, lexer::CodeLocation),
   ArrayLiteral(Vec<AST>, lexer::CodeLocation),
   MapLiteral(Vec<(AST, AST)>, lexer::CodeLocation),
-  StructLiteral(String, Vec<(String, AST)>, lexer::CodeLocation),
-  StructDefinition(String, Vec<String>, Vec<(String, AST)>, lexer::CodeLocation),
+  StructLiteral(Box<AST>, Vec<(String, AST)>, lexer::CodeLocation),
+  StructDefinition(Vec<String>, Vec<(String, AST)>, lexer::CodeLocation),
   Function(
     String,
     Vec<String>,
@@ -137,9 +137,7 @@ impl AST {
         .chain(pairs.iter().map(|(_, b)| b))
         .collect::<Vec<_>>(),
       AST::StructLiteral(_, elements, _) => elements.iter().map(|(_, a)| a).collect::<Vec<_>>(),
-      AST::StructDefinition(_, _, elements, _) => {
-        elements.iter().map(|(_, b)| b).collect::<Vec<_>>()
-      }
+      AST::StructDefinition(_, elements, _) => elements.iter().map(|(_, b)| b).collect::<Vec<_>>(),
       AST::Function(_, _, _, _, body, _) => vec![body],
       AST::MemberAccess(obj, _, _) => vec![obj],
       AST::IndexAccess(obj, index, _) => vec![obj, index],

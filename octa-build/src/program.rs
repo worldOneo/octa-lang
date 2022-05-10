@@ -10,12 +10,15 @@ pub struct StructField {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructType {
-  pub name: String,
+  pub special: u8,
   pub fields: HashMap<String, (usize, StructField)>,
   pub sorted_fields: Vec<(String, StructField)>,
   pub generic_types: Vec<String>,
   pub is_generic: bool,
 }
+
+const STRUCT_SPECIAL_ARR: u8 = 1;
+const STRUCT_SPECIAL_MAP: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionDataType {
@@ -111,8 +114,8 @@ impl DataType {
     }
     if let DataType::Struct(inner) = self {
       if let DataType::Struct(other_inner) = other {
-        return inner.fields.iter().all(|(name, ty)| {
-          other_inner.fields.contains_key(name) && other_inner.fields[name].1.ty.satisfies(&ty.1.ty)
+        return other_inner.fields.iter().all(|(name, ty)| {
+          inner.fields.contains_key(name) && inner.fields[name].1.ty == ty.1.ty
         });
       }
     }
@@ -123,8 +126,8 @@ impl DataType {
             .args
             .iter()
             .zip(other_inner.args.iter())
-            .all(|(a, b)| a.satisfies(&b))
-          && inner.ret.satisfies(&other_inner.ret);
+            .all(|(a, b)| a == b)
+          && inner.ret == other_inner.ret;
       }
     }
 
@@ -337,7 +340,7 @@ impl Interpreter {
     interpreter.type_defs[0][0].insert(
       "map".to_string(),
       DataType::Struct(StructType {
-        name: "map".to_string(),
+        special: STRUCT_SPECIAL_MAP,
         fields: HashMap::new(),
         sorted_fields: vec![],
         generic_types: vec!["K".to_string(), "V".to_string()],
@@ -347,7 +350,7 @@ impl Interpreter {
     interpreter.type_defs[0][0].insert(
       "array".to_string(),
       DataType::Struct(StructType {
-        name: "array".to_string(),
+        special: STRUCT_SPECIAL_ARR,
         fields: HashMap::new(),
         sorted_fields: vec![],
         generic_types: vec!["T".to_string()],
@@ -364,7 +367,7 @@ impl Interpreter {
         .cloned()
         .collect(),
       Box::new(DataType::Struct(StructType {
-        name: "map".to_string(),
+        special: STRUCT_SPECIAL_MAP,
         fields: HashMap::new(),
         sorted_fields: vec![],
         generic_types: vec!["K".to_string(), "V".to_string()],
@@ -377,7 +380,7 @@ impl Interpreter {
     match map {
       DataType::GenericResolved(args, strct) => {
         if let DataType::Struct(ty) = strct.as_ref() {
-          if ty.name != "map" {
+          if ty.special != STRUCT_SPECIAL_MAP {
             return None;
           }
           let k = args.get("K").unwrap().clone();
@@ -395,7 +398,7 @@ impl Interpreter {
     match array {
       DataType::GenericResolved(args, strct) => {
         if let DataType::Struct(ty) = strct.as_ref() {
-          if ty.name != "array" {
+          if ty.special != STRUCT_SPECIAL_ARR {
             return None;
           }
           let v = args.get("T").unwrap().clone();
@@ -412,7 +415,7 @@ impl Interpreter {
     DataType::GenericResolved(
       [("T".to_string(), t.clone())].iter().cloned().collect(),
       Box::new(DataType::Struct(StructType {
-        name: "array".to_string(),
+        special: STRUCT_SPECIAL_ARR,
         fields: HashMap::new(),
         sorted_fields: vec![],
         generic_types: vec!["T".to_string()],
@@ -510,7 +513,7 @@ impl Interpreter {
       AST::Variable(name, loc) => self
         .typedef_by_name(name)
         .ok_or(BuildError::InvalidType(loc.clone())),
-      AST::StructDefinition(name, generics, fields, loc) => {
+      AST::StructDefinition(generics, fields, loc) => {
         let mut type_fields = HashMap::new();
         let mut fields = fields.clone();
         fields.sort_by(|a, b| a.0.cmp(&b.0));
@@ -528,7 +531,7 @@ impl Interpreter {
           .collect::<Vec<_>>();
 
         Ok(DataType::Struct(StructType {
-          name: name.clone(),
+          special: 0,
           fields: type_fields,
           sorted_fields: sorted_fields,
           generic_types: generics.clone(),
@@ -641,7 +644,7 @@ impl Interpreter {
         if op.is_comparison() {
           return Ok(DataType::Bool);
         }
-        if first.satisfies(&second) {
+        if first == second {
           return Ok(first);
         }
         Err(BuildError::ParameterTypeMismatch(
@@ -683,7 +686,7 @@ impl Interpreter {
           }
         }
         return DataType::Struct(StructType {
-          name: first_ty.name.clone(),
+          special: 0,
           fields,
           sorted_fields,
           generic_types: vec![],
@@ -727,7 +730,6 @@ impl Interpreter {
   }
 
   fn pop_stack(&mut self) {
-    self.stack_functions.pop();
     self.stack_offsets.pop();
     self.stack_sizes.pop();
     self.data_types.pop();
@@ -742,7 +744,6 @@ impl Interpreter {
   }
 
   fn add_stack(&mut self) {
-    self.stack_functions.push(HashMap::new());
     self.stack_offsets.push(vec![HashMap::new()]);
     self.stack_sizes.push(0);
     self.data_types.push(vec![HashMap::new()]);
@@ -807,33 +808,26 @@ impl Interpreter {
     value: &AST,
     reg: Register,
   ) -> Result<(Program, DataType), BuildError> {
-    let mut program = vec![];
-    let mut ty = DataType::None;
     match value {
-      AST::IntLiteral(i, _) => {
-        ty = DataType::Int;
-        program.push(Statement::SetIntReg(*i, reg))
-      }
-      AST::FloatLiteral(f, _) => {
-        ty = DataType::Float;
-        program.push(Statement::SetFloatReg(*f, reg))
-      }
-      AST::StringLiteral(s, _) => {
-        ty = DataType::String;
-        program.push(Statement::SetStringReg(s.clone(), reg))
-      }
-      AST::BoolLiteral(b, _) => {
-        ty = DataType::Bool;
-        program.push(Statement::SetBoolReg(*b, reg));
-      }
+      AST::IntLiteral(i, _) => Ok((vec![Statement::SetIntReg(*i, reg)], DataType::Int)),
+      AST::FloatLiteral(f, _) => Ok((vec![Statement::SetFloatReg(*f, reg)], DataType::Float)),
+      AST::StringLiteral(s, _) => Ok((
+        vec![Statement::SetStringReg(s.clone(), reg)],
+        DataType::String,
+      )),
+      AST::BoolLiteral(b, _) => Ok((vec![Statement::SetBoolReg(*b, reg)], DataType::Bool)),
       AST::Call(callee, args, _) => {
-        (_, ty) = self.build_call(callee, args)?;
+        let (mut prog, ty) = self.build_call(callee, args)?;
+        prog.push(Statement::Dupe {
+          reg,
+          val: REG_RETURN,
+        });
+        Ok((prog, ty))
       }
       AST::Variable(name, _) => {
         if let Some(vty) = self.type_by_name(name) {
-          ty = vty.clone();
           if let Some(offset) = self.offset_by_name(name) {
-            program.push(Statement::CopyToReg { offset, reg });
+            return Ok((vec![Statement::CopyToReg { offset, reg }], vty.clone()));
           } else {
             return Err(BuildError::InvalidType(value.location()));
           }
@@ -841,14 +835,12 @@ impl Interpreter {
           Err(BuildError::InvalidType(value.location()))?
         }
       }
-      AST::BinOp(lhs, op, rhs, _) => {
-        let (mut prog, ty) = self.build_bin_op(lhs, op.clone(), rhs, reg)?;
-        program.append(&mut prog);
-        return Ok((program, ty));
+      AST::StructLiteral(..) => {
+        return self.build_struct_literal_to_reg(value, reg);
       }
+      AST::BinOp(lhs, op, rhs, _) => self.build_bin_op(lhs, op.clone(), rhs, reg),
       _ => todo!(),
-    };
-    return Ok((program, ty));
+    }
   }
 
   fn build_value_to_ret(&mut self, value: &AST) -> Result<(Program, DataType), BuildError> {
@@ -937,6 +929,7 @@ impl Interpreter {
         return Ok(program);
       }
       AST::Block(block, _) => self.build_body(block),
+      AST::Call(callee, args, _) => Ok(self.build_call(callee.as_ref(), args)?.0),
       _ => todo!(),
     }
   }
@@ -1087,17 +1080,19 @@ impl Interpreter {
   }
 
   fn build_body(&mut self, body: &Vec<AST>) -> Result<Program, BuildError> {
+    self.stack_functions.push(HashMap::new());
     self.collect_referencable_labels(body)?;
     let mut program = vec![];
     for stmt in body {
       program.append(&mut self.build_statement(stmt)?);
     }
-    let functions = self.stack_functions.pop().unwrap();
+    let functions = self.stack_functions.last().unwrap().clone();
     let functions = functions.values();
     for (function, label) in functions {
       program.push(Statement::Label { name: *label });
       program.append(&mut self.build_patterned_function(function)?);
     }
+    self.stack_functions.pop();
     return Ok(program);
   }
 
@@ -1214,25 +1209,35 @@ impl Interpreter {
     return None;
   }
 
-  fn build_struct_literal_to_reg(&mut self, ast: &AST) -> Result<(Program, DataType), BuildError> {
+  fn build_struct_literal_to_reg(
+    &mut self,
+    ast: &AST,
+    reg: u8,
+  ) -> Result<(Program, DataType), BuildError> {
     match ast {
       AST::StructLiteral(name, fields, _) => {
-        if let Some(ty) = &self.type_by_name(name) {
-          if let DataType::Struct(struct_ty) = ty {
-            let mut program = vec![];
-            for (i, (name, field)) in fields.iter().enumerate() {
-              let (mut field_program, field_ty) = self.build_value_to_reg(field, i as u8)?;
-              program.append(&mut field_program);
-              if !field_ty.satisfies(&struct_ty.fields[name].1.ty) {
-                return Err(BuildError::InvalidType(field.location()));
-              }
+        let ty = self.resolve_typedef(name)?;
+        if let DataType::Struct(struct_ty) = &ty {
+          let mut program = vec![];
+          for (_, (name, field)) in fields.iter().enumerate() {
+            let (mut field_program, field_ty) = self.build_value_to_reg(field, REG_A as u8)?;
+            program.append(&mut field_program);
+            program.push(Statement::Push { reg: REG_A });
+            if field_ty != struct_ty.fields[name].1.ty {
+              return Err(BuildError::InvalidType(field.location()));
             }
-
-            program.push(Statement::Push { reg: REG_RETURN });
-            return Ok((program, ty.clone()));
-          } else {
-            todo!();
           }
+          for (i, _) in fields.iter().enumerate() {
+            program.push(Statement::Pop {
+              reg: (fields.len() - i) as u8,
+            });
+          }
+          program.push(Statement::StructInit {
+            reg: REG_RETURN,
+            size: fields.len(),
+          });
+          program.push(Statement::Push { reg });
+          return Ok((program, ty.clone()));
         } else {
           return Err(BuildError::InvalidType(ast.location()));
         }
@@ -1297,13 +1302,10 @@ impl Interpreter {
     if !from.satisfies(to) {
       return Err(BuildError::InvalidType(loc));
     }
-    if from.is_primitive() {
+    if from.is_primitive() || from == to {
       return Ok(vec![Statement::Dupe { val, reg }]);
     }
-    if from == to {
-      return Ok(vec![Statement::Dupe { val, reg }]);
-    }
-    if let Some(table) = self.build_satisfaction_table(from, to) {
+    if let Some(table) = self.build_satisfaction_table(to, from) {
       return Ok(vec![Statement::DuckConv {
         index: table,
         ptr: val,
@@ -1616,6 +1618,94 @@ mod tests {
     ], l());
 
     let mut interpreter = Interpreter::new(ast);
+    println!("{:?}", interpreter.build().unwrap()); // Visual check iguess (^_^)
+  }
+
+  #[test]
+  fn test_duck_typing() {
+    let l = || lexer::CodeLocation::new("".to_string(), 0);
+    let v = |s: &str| AST::Variable(s.to_string(), l());
+    /*
+      type A = struct {
+        x: int,
+        y: int,
+      }
+      type B = struct {
+        y: int
+      }
+
+      fn c(b: B) {
+
+      }
+
+      fn e() {
+        let a = A { x: 1, y: 2 }
+        c(a)
+      }
+    */
+    let ast = AST::Block(
+      vec![
+        AST::Initialize(
+          AssignType::Type,
+          Box::new(v("A")),
+          Box::new(AST::StructDefinition(
+            vec![],
+            vec![("x".into(), v("int")), ("y".into(), v("int"))],
+            l(),
+          )),
+          l(),
+        ),
+        AST::Initialize(
+          AssignType::Type,
+          Box::new(v("B")),
+          Box::new(AST::StructDefinition(
+            vec![],
+            vec![("y".into(), v("int"))],
+            l(),
+          )),
+          l(),
+        ),
+        AST::Function(
+          "c".to_string(),
+          vec![],
+          vec![(v("b"), v("B"))],
+          Box::new(AST::None(l())),
+          Box::new(AST::Block(vec![], l())),
+          l(),
+        ),
+        AST::Function(
+          "e".to_string(),
+          vec![],
+          vec![],
+          Box::new(AST::None(l())),
+          Box::new(AST::Block(
+            vec![
+              AST::Initialize(
+                AssignType::Let,
+                Box::new(v("a")),
+                Box::new(AST::StructLiteral(
+                  Box::new(v("A")),
+                  vec![
+                    ("x".into(), AST::IntLiteral(1, l())),
+                    ("y".into(), AST::IntLiteral(2, l())),
+                  ],
+                  l(),
+                )),
+                l(),
+              ),
+              AST::Call(Box::new(v("c")), vec![v("a")], l()),
+            ],
+            l(),
+          )),
+          l(),
+        ),
+      ],
+      l(),
+    );
+
+    let mut interpreter = Interpreter::new(ast);
+    interpreter.build().unwrap();
+    assert_eq!(interpreter.duck_tables[0], vec![1]);
     println!("{:?}", interpreter.build().unwrap()); // Visual check iguess (^_^)
   }
 
