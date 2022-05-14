@@ -95,14 +95,94 @@ pub enum DataType {
   Float,
   Bool,
   String,
-  Struct(StructType),
-  Function(Box<FunctionDataType>),
-  Generic(String),
-  GenericResolved(HashMap<String, DataType>, Box<DataType>),
+  Struct {
+    id: usize,
+    ty: StructType,
+  },
+  Function {
+    ty: Box<FunctionDataType>,
+  },
+  Generic {
+    name: String,
+  },
+  GenericResolved {
+    solve: HashMap<String, DataType>,
+    ty: Box<DataType>,
+  },
   Const(Box<DataType>),
 }
 
 impl DataType {
+  pub fn prog_eq(&self, other: &DataType) -> bool {
+    match (self, other) {
+      (DataType::Unresolved, DataType::Unresolved) => true,
+      (DataType::None, DataType::None) => true,
+      (DataType::Int, DataType::Int) => true,
+      (DataType::Float, DataType::Float) => true,
+      (DataType::Bool, DataType::Bool) => true,
+      (DataType::String, DataType::String) => true,
+      (DataType::Struct { id: id1, ty: ty1 }, DataType::Struct { id: id2, ty: ty2 }) => {
+        if ty1.special != ty2.special {
+          return false;
+        }
+        if ty1.fields.len() != ty2.fields.len() {
+          return false;
+        }
+        for (name, (_, field1)) in &ty1.fields {
+          if let Some((_, field2)) = &ty2.fields.get(name) {
+            if !field1.ty.prog_eq(&field2.ty) {
+              return false;
+            }
+          } else {
+            return false;
+          }
+        }
+        true
+      }
+      (DataType::Function { ty: ty1 }, DataType::Function { ty: ty2 }) => {
+        if ty1.name != ty2.name {
+          return false;
+        }
+        if ty1.args.len() != ty2.args.len() {
+          return false;
+        }
+        for (arg1, arg2) in ty1.args.iter().zip(ty2.args.iter()) {
+          if !arg1.prog_eq(arg2) {
+            return false;
+          }
+        }
+        return ty1.ret.prog_eq(&ty2.ret);
+      }
+      (DataType::Generic { name: name1 }, DataType::Generic { name: name2 }) => name1 == name2,
+      (
+        DataType::GenericResolved {
+          solve: solve1,
+          ty: ty1,
+        },
+        DataType::GenericResolved {
+          solve: solve2,
+          ty: ty2,
+        },
+      ) => {
+        if solve1.len() != solve2.len() {
+          return false;
+        }
+        for (name, ty) in solve1.iter() {
+          if let Some(ty2) = solve2.get(name) {
+            if !ty.prog_eq(ty2) {
+              return false;
+            }
+          } else {
+            return false;
+          }
+        }
+        ty1.prog_eq(ty2)
+      }
+      (DataType::Const(ty1), DataType::Const(ty2)) => ty1.prog_eq(ty2),
+      _ => false,
+    }
+  }
+
   pub fn satisfies(&self, other: &DataType) -> bool {
     if self == other {
       return true;
@@ -112,26 +192,39 @@ impl DataType {
     } else if let DataType::Const(other) = other {
       return self.satisfies(other);
     }
-    if let DataType::Struct(inner) = self {
-      if let DataType::Struct(other_inner) = other {
-        return other_inner.fields.iter().all(|(name, ty)| {
-          inner.fields.contains_key(name) && inner.fields[name].1.ty == ty.1.ty
-        });
+    if let DataType::Struct { ty: inner, .. } = self {
+      if let DataType::Struct {
+        ty: other_inner, ..
+      } = other
+      {
+        return other_inner
+          .fields
+          .iter()
+          .all(|(name, ty)| inner.fields.contains_key(name) && inner.fields[name].1.ty == ty.1.ty);
       }
     }
-    if let DataType::Function(inner) = self {
-      if let DataType::Function(other_inner) = other {
+    if let DataType::Function { ty: inner } = self {
+      if let DataType::Function { ty: other_inner } = other {
         return inner.args.len() == other_inner.args.len()
           && inner
             .args
             .iter()
             .zip(other_inner.args.iter())
-            .all(|(a, b)| a == b)
-          && inner.ret == other_inner.ret;
+            .all(|(a, b)| a.prog_eq(&b))
+          && inner.ret.prog_eq(&other_inner.ret);
       }
     }
 
     return false;
+  }
+
+  pub fn get_generic_names(&self) -> Vec<String> {
+    match self {
+      DataType::GenericResolved { solve, .. } => solve.keys().into_iter().cloned().collect(),
+      DataType::Struct { ty, .. } => ty.generic_types.clone(),
+      DataType::Function { ty, .. } => ty.as_ref().generic_types.clone(),
+      _ => vec![],
+    }
   }
 
   pub fn is_const(&self) -> bool {
@@ -143,8 +236,25 @@ impl DataType {
 
   pub fn is_primitive(&self) -> bool {
     match self {
-      DataType::Int | DataType::Float | DataType::Bool | DataType::String => true,
+      DataType::Int
+      | DataType::Float
+      | DataType::Bool
+      | DataType::String
+      | DataType::Function { .. } => true,
       _ => false,
+    }
+  }
+
+  pub fn type_id(&self) -> usize {
+    match self {
+      DataType::Unresolved => 0,
+      DataType::None => 1,
+      DataType::Int => 2,
+      DataType::Float => 3,
+      DataType::Bool => 4,
+      DataType::String => 5,
+      DataType::Struct { id, .. } => *id,
+      _ => todo!(),
     }
   }
 }
@@ -227,6 +337,7 @@ pub enum Statement {
   },
   MapInit {
     reg: Register,
+    size: usize,
   },
   ArrayInit {
     reg: Register,
@@ -245,9 +356,14 @@ pub enum Statement {
     reg: Register,
     ptr: Register,
     index: usize,
+    from: usize,
+    to: usize,
   },
   CallNative {
     name: String,
+  },
+  StackDec {
+    size: usize,
   },
 }
 const REG_A: Register = 0;
@@ -259,6 +375,7 @@ pub type Program = Vec<Statement>;
 
 pub struct Interpreter {
   pub syntax: AST,
+  pub type_count: usize,
   pub duck_table_index: HashMap<Vec<usize>, usize>,
   pub duck_tables: Vec<Vec<usize>>,
   pub label_count: usize,
@@ -323,6 +440,7 @@ pub fn args_match(
 impl Interpreter {
   pub fn new(syntax: AST) -> Interpreter {
     let mut interpreter = Interpreter {
+      type_count: 100,
       label_count: 0,
       syntax,
       duck_table_index: HashMap::new(),
@@ -337,58 +455,56 @@ impl Interpreter {
     interpreter.type_defs[0][0].insert("float".to_string(), DataType::Float);
     interpreter.type_defs[0][0].insert("bool".to_string(), DataType::Bool);
     interpreter.type_defs[0][0].insert("string".to_string(), DataType::String);
-    interpreter.type_defs[0][0].insert(
-      "map".to_string(),
-      DataType::Struct(StructType {
-        special: STRUCT_SPECIAL_MAP,
-        fields: HashMap::new(),
-        sorted_fields: vec![],
-        generic_types: vec!["K".to_string(), "V".to_string()],
-        is_generic: true,
-      }),
+    let map = interpreter.build_map_type(
+      &DataType::Generic { name: "K".into() },
+      &DataType::Generic { name: "V".into() },
     );
-    interpreter.type_defs[0][0].insert(
-      "array".to_string(),
-      DataType::Struct(StructType {
-        special: STRUCT_SPECIAL_ARR,
-        fields: HashMap::new(),
-        sorted_fields: vec![],
-        generic_types: vec!["T".to_string()],
-        is_generic: true,
-      }),
-    );
+    interpreter.type_defs[0][0].insert("map".into(), map);
+    let array = interpreter.build_array_type(&DataType::Generic { name: "T".into() });
+    interpreter.type_defs[0][0].insert("array".to_string(), array);
     interpreter
   }
 
-  fn build_map_type(k: &DataType, v: &DataType) -> DataType {
-    DataType::GenericResolved(
-      [("K".to_string(), k.clone()), ("V".to_string(), v.clone())]
-        .iter()
-        .cloned()
-        .collect(),
-      Box::new(DataType::Struct(StructType {
+  fn next_type_id(&mut self) -> usize {
+    self.type_count += 1;
+    self.type_count
+  }
+
+  fn build_map_type(&mut self, k: &DataType, v: &DataType) -> DataType {
+    DataType::Struct {
+      id: self.next_type_id(),
+      ty: StructType {
         special: STRUCT_SPECIAL_MAP,
-        fields: HashMap::new(),
-        sorted_fields: vec![],
+        fields: vec![
+          ("k".into(), (0, StructField { ty: k.clone() })),
+          ("v".into(), (1, StructField { ty: v.clone() })),
+        ]
+        .into_iter()
+        .collect(),
+        sorted_fields: vec![
+          ("k".into(), StructField { ty: k.clone() }),
+          ("v".into(), StructField { ty: v.clone() }),
+        ],
         generic_types: vec!["K".to_string(), "V".to_string()],
         is_generic: true,
-      })),
-    )
+      },
+    }
   }
 
   fn as_map_key_val(map: &DataType) -> Option<(DataType, DataType)> {
     match map {
-      DataType::GenericResolved(args, strct) => {
-        if let DataType::Struct(ty) = strct.as_ref() {
-          if ty.special != STRUCT_SPECIAL_MAP {
-            return None;
-          }
-          let k = args.get("K").unwrap().clone();
-          let v = args.get("V").unwrap().clone();
-          Some((k, v))
-        } else {
-          None
+      DataType::Struct {
+        ty: StructType {
+          special,
+          sorted_fields,
+          ..
+        },
+        ..
+      } => {
+        if *special == STRUCT_SPECIAL_MAP {
+          return Some((sorted_fields[0].1.ty.clone(), sorted_fields[1].1.ty.clone()));
         }
+        None
       }
       _ => None,
     }
@@ -396,32 +512,36 @@ impl Interpreter {
 
   fn as_array_val(array: &DataType) -> Option<DataType> {
     match array {
-      DataType::GenericResolved(args, strct) => {
-        if let DataType::Struct(ty) = strct.as_ref() {
-          if ty.special != STRUCT_SPECIAL_ARR {
-            return None;
-          }
-          let v = args.get("T").unwrap().clone();
-          Some(v)
-        } else {
-          None
+      DataType::Struct {
+        ty: StructType {
+          special,
+          sorted_fields: fields,
+          ..
+        },
+        ..
+      } => {
+        if *special != STRUCT_SPECIAL_ARR {
+          return None;
         }
+        return Some(fields[0].1.ty.clone());
       }
       _ => None,
     }
   }
 
-  fn build_array_type(t: &DataType) -> DataType {
-    DataType::GenericResolved(
-      [("T".to_string(), t.clone())].iter().cloned().collect(),
-      Box::new(DataType::Struct(StructType {
+  fn build_array_type(&mut self, t: &DataType) -> DataType {
+    DataType::Struct {
+      id: self.next_type_id(),
+      ty: StructType {
         special: STRUCT_SPECIAL_ARR,
-        fields: HashMap::new(),
-        sorted_fields: vec![],
+        fields: vec![("t".into(), (0, StructField { ty: t.clone() }))]
+          .into_iter()
+          .collect(),
+        sorted_fields: vec![("t".into(), StructField { ty: t.clone() })],
         generic_types: vec!["T".to_string()],
         is_generic: true,
-      })),
-    )
+      },
+    }
   }
 
   pub fn get_visible_scopes(&self) -> &Vec<HashMap<String, DataType>> {
@@ -433,36 +553,29 @@ impl Interpreter {
     &scopes[scopes.len() - 1]
   }
 
-  pub fn get_root_scopes(&self) -> &HashMap<String, DataType> {
-    &self.data_types[0][0]
-  }
-
   pub fn get_visible_offsets(&self) -> &Vec<HashMap<String, usize>> {
     &self.stack_offsets[self.stack_sizes.len() - 1]
   }
 
   pub fn type_by_name(&self, name: &String) -> Option<DataType> {
-    for scope in self.get_visible_scopes().iter().rev() {
-      if let Some(ty) = scope.get(name) {
-        return Some(ty.clone());
+    // TODO: Capture variable
+    for types in self.data_types.iter().rev() {
+      for scope in types.iter().rev() {
+        if let Some(ty) = scope.get(name) {
+          return Some(ty.clone());
+        }
       }
-    }
-
-    if let Some(ty) = self.get_root_scopes().get(name) {
-      return Some(ty.clone());
     }
     None
   }
 
   pub fn typedef_by_name(&self, name: &String) -> Option<DataType> {
-    for scope in self.type_defs.last().unwrap().iter().rev() {
-      if let Some(ty) = scope.get(name) {
-        return Some(ty.clone());
+    for types in self.type_defs.iter().rev() {
+      for scope in types.iter().rev() {
+        if let Some(ty) = scope.get(name) {
+          return Some(ty.clone());
+        }
       }
-    }
-
-    if let Some(ty) = self.type_defs[0][0].get(name) {
-      return Some(ty.clone());
     }
     None
   }
@@ -498,7 +611,9 @@ impl Interpreter {
     loc: lexer::CodeLocation,
   ) -> Result<DataType, BuildError> {
     match first {
-      DataType::Struct(struct_type) => {
+      DataType::Struct {
+        ty: struct_type, ..
+      } => {
         if let Some(ty) = struct_type.fields.get(second) {
           return Ok(ty.1.ty.clone());
         }
@@ -512,7 +627,7 @@ impl Interpreter {
     match ast {
       AST::Variable(name, loc) => self
         .typedef_by_name(name)
-        .ok_or(BuildError::InvalidType(loc.clone())),
+        .ok_or(BuildError::TokenDoesntExist(loc.clone())),
       AST::StructDefinition(generics, fields, loc) => {
         let mut type_fields = HashMap::new();
         let mut fields = fields.clone();
@@ -530,17 +645,21 @@ impl Interpreter {
           .map(|(name, (_, field))| (name, field))
           .collect::<Vec<_>>();
 
-        Ok(DataType::Struct(StructType {
-          special: 0,
-          fields: type_fields,
-          sorted_fields: sorted_fields,
-          generic_types: generics.clone(),
-          is_generic: !generics.is_empty(),
-        }))
+        Ok(DataType::Struct {
+          id: self.next_type_id(),
+          ty: StructType {
+            special: 0,
+            fields: type_fields,
+            sorted_fields: sorted_fields,
+            generic_types: generics.clone(),
+            is_generic: !generics.is_empty(),
+          },
+        })
       }
       AST::GenericIdentifier(ty, resolved, loc) => {
         let ty = self.resolve_typedef(ty)?;
-        self.resolve_generic_type(&ty, resolved, loc)
+        let ty = self.resolve_generic_type(&ty, resolved, loc)?;
+        Ok(self.destruct_generic_resolved(&ty))
       }
       AST::FunctionDefinition(generics, args, ret, loc) => self.build_fn_def(
         "".to_string(),
@@ -566,25 +685,106 @@ impl Interpreter {
     }
     let mut resolved_ty = HashMap::new();
     match ty.clone() {
-      DataType::Function(func) => {
+      DataType::Function { ty: func } => {
         if func.generic_types.len() != args_ty.len() {
           return Err(BuildError::GenericTypeMismatch(loc.clone()));
         }
         for (i, ty) in func.generic_types.iter().enumerate() {
           resolved_ty.insert(ty.clone(), args_ty[i].clone());
         }
-        return Ok(DataType::GenericResolved(resolved_ty, Box::new(ty.clone())));
+        return Ok(DataType::GenericResolved {
+          solve: resolved_ty,
+          ty: Box::new(ty.clone()),
+        });
       }
-      DataType::Struct(stru) => {
+      DataType::Struct { ty: stru, .. } => {
         if stru.generic_types.len() != args_ty.len() {
           return Err(BuildError::GenericTypeMismatch(loc.clone()));
         }
         for (i, ty) in stru.generic_types.iter().enumerate() {
           resolved_ty.insert(ty.clone(), args_ty[i].clone());
         }
-        return Ok(DataType::GenericResolved(resolved_ty, Box::new(ty.clone())));
+        return Ok(DataType::GenericResolved {
+          solve: resolved_ty,
+          ty: Box::new(ty.clone()),
+        });
       }
       _ => return Err(BuildError::GenericTypeMismatch(loc.clone())),
+    }
+  }
+
+  pub fn destruct_generic_resolved(&mut self, ty: &DataType) -> DataType {
+    match ty {
+      DataType::GenericResolved { solve, ty, .. } => {
+        self.add_scope();
+        for (key, val) in solve.iter() {
+          self.set_typedef(key, val.clone());
+        }
+        let ty = self.destruct_generic_resolved(ty);
+        self.pop_scope();
+        return ty;
+      }
+      DataType::Struct { id, ty, .. } => {
+        let fields = ty.fields.clone();
+        let sorted_fields = ty.sorted_fields.clone();
+        let sorted_fields = sorted_fields
+          .iter()
+          .map(|(name, field)| {
+            (
+              name.clone(),
+              StructField {
+                ty: self.destruct_generic_resolved(&field.ty),
+              },
+            )
+          })
+          .collect();
+        let fields = fields
+          .into_iter()
+          .map(|(name, field)| {
+            (
+              name.clone(),
+              (
+                field.0,
+                StructField {
+                  ty: self.destruct_generic_resolved(&field.1.ty),
+                },
+              ),
+            )
+          })
+          .collect();
+
+        return DataType::Struct {
+          id: *id,
+          ty: StructType {
+            special: ty.special,
+            fields,
+            sorted_fields,
+            generic_types: ty.generic_types.clone(),
+            is_generic: ty.is_generic,
+          },
+        };
+      }
+      DataType::Function { ty: func, .. } => {
+        let mut args = func.args.clone();
+        for i in 0..args.len() {
+          args[i] = self.destruct_generic_resolved(&args[i]);
+        }
+        return DataType::Function {
+          ty: Box::new(FunctionDataType {
+            name: func.name.clone(),
+            args,
+            ret: self.destruct_generic_resolved(&func.ret),
+            generic_types: func.generic_types.clone(),
+            is_generic: func.is_generic,
+          }),
+        };
+      }
+      DataType::Generic { name, .. } => {
+        return self
+          .typedef_by_name(name)
+          .unwrap_or(DataType::Generic { name: name.clone() });
+      }
+      _ => ty.clone(),
     }
   }
 
@@ -599,7 +799,7 @@ impl Interpreter {
       }
       AST::Call(callee, args, loc) => {
         let callee_ty = self.resolve_type(callee)?;
-        if let DataType::Function(func) = callee_ty {
+        if let DataType::Function { ty: func } = callee_ty {
           let mut args_ty = vec![];
           for arg in args {
             args_ty.push(self.resolve_type(arg)?);
@@ -620,23 +820,23 @@ impl Interpreter {
           }
           vals.push(self.resolve_type(&kv.1)?);
         }
-        let key_ty = Interpreter::create_lowest_applicable_type(&keys);
-        let val_ty = Interpreter::create_lowest_applicable_type(&vals);
+        let key_ty = self.create_lowest_applicable_type(&keys);
+        let val_ty = self.create_lowest_applicable_type(&vals);
         if key_ty == DataType::None || val_ty == DataType::None {
           return Err(BuildError::TypeNotInferable(loc.clone()));
         }
-        Ok(Interpreter::build_map_type(&key_ty, &val_ty))
+        Ok(self.build_map_type(&key_ty, &val_ty))
       }
       AST::ArrayLiteral(vals, loc) => {
         let mut vals_ty = vec![];
         for val in vals {
           vals_ty.push(self.resolve_type(val)?);
         }
-        let ty = Interpreter::create_lowest_applicable_type(&vals_ty);
+        let ty = self.create_lowest_applicable_type(&vals_ty);
         if ty == DataType::None {
           return Err(BuildError::TypeNotInferable(loc.clone()));
         }
-        Ok(Interpreter::build_array_type(&ty))
+        Ok(self.build_array_type(&ty))
       }
       AST::BinOp(first, op, second, loc) => {
         let first = self.resolve_type(first)?;
@@ -655,7 +855,8 @@ impl Interpreter {
       }
       AST::GenericIdentifier(ty, resolved, loc) => {
         let ty = self.resolve_type(ty)?;
-        self.resolve_generic_type(&ty, resolved, loc)
+        let ty = self.resolve_generic_type(&ty, resolved, loc)?;
+        Ok(self.destruct_generic_resolved(&ty))
       }
       AST::IntLiteral(_, _) => Ok(DataType::Int),
       AST::FloatLiteral(_, _) => Ok(DataType::Float),
@@ -665,7 +866,7 @@ impl Interpreter {
     }
   }
 
-  pub fn create_type_intersection(first: &DataType, second: &DataType) -> DataType {
+  pub fn create_type_intersection(&mut self, first: &DataType, second: &DataType) -> DataType {
     if first == second {
       return first.clone();
     }
@@ -675,8 +876,8 @@ impl Interpreter {
     if second == &DataType::Unresolved {
       return first.clone();
     }
-    if let DataType::Struct(first_ty) = first {
-      if let DataType::Struct(second_ty) = second {
+    if let DataType::Struct { ty: first_ty, .. } = first {
+      if let DataType::Struct { ty: second_ty, .. } = second {
         let mut fields = HashMap::new();
         let mut sorted_fields = vec![];
         for (field_name, _) in &first_ty.fields {
@@ -685,21 +886,24 @@ impl Interpreter {
             sorted_fields.push((field_name.clone(), field_type.1.clone()));
           }
         }
-        return DataType::Struct(StructType {
-          special: 0,
-          fields,
-          sorted_fields,
-          generic_types: vec![],
-          is_generic: false,
-        });
+        return DataType::Struct {
+          id: self.next_type_id(),
+          ty: StructType {
+            special: 0,
+            fields,
+            sorted_fields,
+            generic_types: vec![],
+            is_generic: false,
+          },
+        };
       }
     }
     return DataType::None;
   }
 
-  pub fn create_lowest_applicable_type(types: &Vec<DataType>) -> DataType {
+  pub fn create_lowest_applicable_type(&mut self, types: &Vec<DataType>) -> DataType {
     types.iter().fold(types[0].clone(), |acc, ty| {
-      Interpreter::create_type_intersection(&acc, ty)
+      self.create_type_intersection(&acc, ty)
     })
   }
 
@@ -737,9 +941,7 @@ impl Interpreter {
 
   fn pop_scope(&mut self) {
     let last = self.stack_sizes.len() - 1;
-    let scope_vars = self.get_current_scope().len();
-    self.stack_sizes[last] -= scope_vars;
-    self.stack_offsets.last_mut().unwrap().pop();
+    self.stack_sizes[last] -= self.stack_offsets.last_mut().unwrap().pop().unwrap().len();
     self.data_types.last_mut().unwrap().pop();
   }
 
@@ -793,14 +995,18 @@ impl Interpreter {
   }
 
   fn get_fn_label(&self, callee: &AST) -> Result<usize, BuildError> {
-    if let AST::Variable(name, _) = callee {
-      for stack in self.stack_functions.iter().rev() {
-        if let Some((_, label)) = stack.get(name) {
-          return Ok(*label);
+    match callee {
+      AST::Variable(name, _) => {
+        for stack in self.stack_functions.iter().rev() {
+          if let Some((_, label)) = stack.get(name) {
+            return Ok(*label);
+          }
         }
+        Err(BuildError::InvalidCall(callee.location()))
       }
+      AST::GenericIdentifier(ast, ..) => self.get_fn_label(ast),
+      _ => Err(BuildError::InvalidCall(callee.location())),
     }
-    return Err(BuildError::InvalidCall(callee.location()));
   }
 
   fn build_value_to_reg(
@@ -835,11 +1041,62 @@ impl Interpreter {
           Err(BuildError::InvalidType(value.location()))?
         }
       }
-      AST::StructLiteral(..) => {
-        return self.build_struct_literal_to_reg(value, reg);
-      }
+      AST::StructLiteral(..) => return self.build_struct_literal_to_reg(value, reg),
       AST::BinOp(lhs, op, rhs, _) => self.build_bin_op(lhs, op.clone(), rhs, reg),
+      AST::GenericIdentifier(..) => self.build_generic_identifier_to_reg(value, reg),
+      AST::MapLiteral(..) => self.build_map_literal_to_reg(value, reg),
       _ => todo!(),
+    }
+  }
+
+  fn build_map_literal_to_reg(
+    &mut self,
+    map: &AST,
+    reg: Register,
+  ) -> Result<(Program, DataType), BuildError> {
+    match map {
+      AST::MapLiteral(kv, ..) => {
+        let mut prog = vec![];
+        for (key, value) in kv {
+          let (mut key_prog, ..) = self.build_value_to_reg(key, REG_A)?;
+          prog.append(&mut key_prog);
+          prog.push(Statement::Push { reg: REG_A });
+          let (mut value_prog, ..) = self.build_value_to_reg(value, REG_A)?;
+          prog.append(&mut value_prog);
+          prog.push(Statement::Push { reg: REG_A });
+        }
+        prog.push(Statement::MapInit {
+          size: kv.len(),
+          reg,
+        });
+        prog.push(Statement::StackDec { size: kv.len() * 2 });
+        Ok((prog, self.resolve_type(&map)?))
+      }
+      _ => panic!("build_map_literal_to_reg expected AST::MapLiteral"),
+    }
+  }
+
+  fn build_generic_identifier_to_reg(
+    &mut self,
+    value: &AST,
+    reg: Register,
+  ) -> Result<(Program, DataType), BuildError> {
+    match value {
+      AST::GenericIdentifier(ty, generic_args, _) => {
+        self.add_scope();
+        let generic_names = self.resolve_type(ty.as_ref())?;
+        for (arg, name) in generic_args
+          .iter()
+          .zip(generic_names.get_generic_names().iter())
+        {
+          let def = self.resolve_typedef(arg)?;
+          self.set_data_type(name, def);
+        }
+        let res = self.build_value_to_reg(ty, reg);
+        self.pop_scope();
+        res
+      }
+      _ => panic!("build_generic_identifier_to_reg expected AST::GenericIdentifier"),
     }
   }
 
@@ -852,7 +1109,14 @@ impl Interpreter {
     callee: &AST,
     args: &Vec<AST>,
   ) -> Result<(Program, DataType), BuildError> {
-    if let DataType::Function(func) = self.resolve_type(callee)? {
+    if let DataType::Function { ty: func } = self.resolve_type(callee)? {
+      if args.len() != func.args.len() {
+        return Err(BuildError::ParameterLenMismatch(
+          args.len(),
+          func.args.len(),
+          callee.location(),
+        ));
+      }
       let mut program = vec![];
       let label = self.get_fn_label(&callee)?;
       for i in 0..args.len() {
@@ -950,7 +1214,7 @@ impl Interpreter {
   ) -> Result<Program, BuildError> {
     match stmt {
       AST::MapLiteral(map, _) => {
-        if let Some((key_ty, val_ty)) = Interpreter::as_map_key_val(&ty) {
+        if let Some((key_ty, val_ty)) = Self::as_map_key_val(&ty) {
           let mut program = vec![];
           for (key, value) in map {
             let key = &self.as_map_key(key);
@@ -1065,7 +1329,7 @@ impl Interpreter {
         }
         AST::Function(name, generic, args, ret, body, loc) => {
           let ty = self.build_fn_def(name.clone(), &generic, &args, &ret, &body, loc.clone())?;
-          if let DataType::Function(_) = &ty {
+          if let DataType::Function { .. } = &ty {
             let (name, f) = self.build_fn(stmt)?;
             self.set_data_type(&name, ty);
             self.stack_add_function(&name, f)?;
@@ -1099,7 +1363,7 @@ impl Interpreter {
   fn add_generic_scope(&mut self, generic: &Vec<String>) {
     self.add_scope();
     for arg in generic.iter() {
-      let arg_type = DataType::Generic(arg.clone());
+      let arg_type = DataType::Generic { name: arg.clone() };
       self.set_typedef(arg, arg_type);
     }
   }
@@ -1155,7 +1419,7 @@ impl Interpreter {
     match ast {
       AST::Function(name, generics, args, ret, body, loc) => {
         let ty = self.build_fn_def(name.to_string(), &generics, &args, &ret, &body, loc.clone())?;
-        if let DataType::Function(fn_ty) = ty {
+        if let DataType::Function { ty: fn_ty } = ty {
           return Ok((
             name.into(),
             Function {
@@ -1187,8 +1451,8 @@ impl Interpreter {
     if !duck.satisfies(reach) {
       panic!("build_satisfaction_table: duck does not satisfy reach");
     }
-    if let DataType::Struct(strct) = reach {
-      if let DataType::Struct(duck_strct) = duck {
+    if let DataType::Struct { ty: strct, .. } = reach {
+      if let DataType::Struct { ty: duck_strct, .. } = duck {
         let mut diff = vec![];
         let other_idx: usize = 0;
         let duck_fields = &duck_strct.sorted_fields;
@@ -1217,7 +1481,7 @@ impl Interpreter {
     match ast {
       AST::StructLiteral(name, fields, _) => {
         let ty = self.resolve_typedef(name)?;
-        if let DataType::Struct(struct_ty) = &ty {
+        if let DataType::Struct { ty: struct_ty, .. } = &ty {
           let mut program = vec![];
           for (_, (name, field)) in fields.iter().enumerate() {
             let (mut field_program, field_ty) = self.build_value_to_reg(field, REG_A as u8)?;
@@ -1252,13 +1516,13 @@ impl Interpreter {
     reg: Register,
   ) -> Result<Program, BuildError> {
     match &ty {
-      DataType::Struct(strct) => {
+      DataType::Struct { ty: strct, .. } => {
         let mut program = vec![];
         if let Some(_) = Self::as_array_val(ty) {
           program.push(Statement::ArrayInit { reg, size: 0 });
           return Ok(program);
         } else if let Some((_, _)) = Self::as_map_key_val(ty) {
-          program.push(Statement::MapInit { reg });
+          program.push(Statement::MapInit { reg, size: 0 });
           return Ok(program);
         }
         for (_, field) in strct.sorted_fields.iter().enumerate() {
@@ -1291,6 +1555,16 @@ impl Interpreter {
     }
   }
 
+  fn is_runtime_primitive(&self, ty: &DataType) -> bool {
+    if let Some(_) = Self::as_array_val(ty) {
+      return true;
+    }
+    if let Some((_, _)) = Self::as_map_key_val(ty) {
+      return true;
+    }
+    return ty.is_primitive();
+  }
+
   fn build_convert_type_to_reg(
     &mut self,
     val: Register,
@@ -1302,7 +1576,7 @@ impl Interpreter {
     if !from.satisfies(to) {
       return Err(BuildError::InvalidType(loc));
     }
-    if from.is_primitive() || from == to {
+    if self.is_runtime_primitive(from) || from == to {
       return Ok(vec![Statement::Dupe { val, reg }]);
     }
     if let Some(table) = self.build_satisfaction_table(to, from) {
@@ -1310,6 +1584,8 @@ impl Interpreter {
         index: table,
         ptr: val,
         reg,
+        from: from.type_id(),
+        to: to.type_id(),
       }]);
     }
     return Err(BuildError::InvalidType(loc));
@@ -1383,10 +1659,10 @@ impl Interpreter {
       ret => self.resolve_typedef(ret)?,
     };
 
-    let current = self.type_by_name(&name);
+    let current = self.typedef_by_name(&name);
 
     if let Some(current) = current {
-      if let DataType::Function(current) = current {
+      if let DataType::Function { ty: current } = current {
         if current.args.len() != parsed_args.len() {
           return Err(BuildError::ParameterLenMismatch(
             current.args.len(),
@@ -1395,7 +1671,7 @@ impl Interpreter {
           ));
         }
         for (i, arg) in current.args.iter().enumerate() {
-          let ty = Interpreter::create_type_intersection(arg, &parsed_args[i]);
+          let ty = self.create_type_intersection(arg, &parsed_args[i]);
           if ty == DataType::None {
             return Err(BuildError::ParameterZeroIntersection(i, loc.clone()));
           }
@@ -1414,21 +1690,32 @@ impl Interpreter {
       self.pop_scope(); // pop generic resolved scope
     }
     self.pop_stack();
-    Ok(DataType::Function(Box::new(FunctionDataType {
-      name,
-      args: parsed_args,
-      ret,
-      is_generic: !generic.is_empty(),
-      generic_types: generic.clone(),
-    })))
+    Ok(DataType::Function {
+      ty: Box::new(FunctionDataType {
+        name,
+        args: parsed_args,
+        ret,
+        is_generic: !generic.is_empty(),
+        generic_types: generic.clone(),
+      }),
+    })
   }
 }
 
 #[cfg(test)]
 mod tests {
+  use std::cell::RefCell;
+
   use octa_parse::parser;
 
   use super::*;
+  macro_rules! assert_dt {
+    ($a:expr, $b:expr) => {
+      assert!($a.is_some());
+      assert!($b.is_some());
+      assert!($a.unwrap().prog_eq(&$b.unwrap()));
+    };
+  }
 
   #[test]
   #[rustfmt::skip]
@@ -1459,17 +1746,17 @@ mod tests {
 
     let mut interpreter = Interpreter::new(ast);
     interpreter.build().unwrap();
-    assert_eq!(interpreter.typedef_by_name(&"i".to_string()), Some(DataType::Int));
-    assert_eq!(interpreter.typedef_by_name(&"b".to_string()), Some(DataType::Bool));
-    assert_eq!(interpreter.typedef_by_name(&"f".to_string()), Some(DataType::Float));
-    assert_eq!(interpreter.typedef_by_name(&"s".to_string()), Some(DataType::String));
-    assert_eq!(interpreter.type_by_name(&"e".to_string()), Some(DataType::Function(Box::new(FunctionDataType {
+    assert_dt!(interpreter.typedef_by_name(&"i".into()), Some(DataType::Int));
+    assert_dt!(interpreter.typedef_by_name(&"b".into()), Some(DataType::Bool));
+    assert_dt!(interpreter.typedef_by_name(&"f".into()), Some(DataType::Float));
+    assert_dt!(interpreter.typedef_by_name(&"s".into()), Some(DataType::String));
+    assert_dt!(interpreter.type_by_name(&"e".into()), Some(DataType::Function { ty: Box::new(FunctionDataType {
       name: "e".to_string(),
-      args: vec![DataType::Int, Interpreter::build_map_type(&DataType::String, &DataType::Int)],
+      args: vec![DataType::Int, Interpreter::build_map_type(&mut interpreter, &DataType::String, &DataType::Int)],
       ret: DataType::String,
       is_generic: false,
       generic_types: vec![],
-    }))));
+    })}));
   }
 
   #[test]
@@ -1489,14 +1776,14 @@ mod tests {
     let mut interpreter = Interpreter::new(ast);
     interpreter.build().unwrap();
     assert_eq!(interpreter.type_by_name(&"e".to_string()), Some(
-      DataType::Function(Box::new(FunctionDataType {
+      DataType::Function{ty: Box::new(FunctionDataType {
         name: "e".to_string(),
-        args: vec![DataType::Generic("T".to_string())],
-        ret: DataType::Generic("T".to_string()),
+        args: vec![DataType::Generic { name: "T".into() }],
+        ret: DataType::Generic { name: "T".into() },
         is_generic: true,
         generic_types: vec!["T".to_string()],
       }
-    ))));
+    )}));
   }
 
   #[test]
@@ -1528,18 +1815,17 @@ mod tests {
 
     let mut interpreter = Interpreter::new(ast);
     interpreter.build().unwrap();
-    assert_eq!(
+    assert_dt!(
       interpreter.typedef_by_name(&"i".to_string()),
-      Some(DataType::GenericResolved(
-        [("T".to_string(), DataType::Int)].iter().cloned().collect(),
-        Box::new(DataType::Function(Box::new(FunctionDataType {
+      Some(DataType::Function {
+        ty: Box::new(FunctionDataType {
           name: "".to_string(),
-          args: vec![DataType::Generic("T".to_string())],
-          ret: DataType::Generic("T".to_string()),
+          args: vec![DataType::Int],
+          ret: DataType::Int,
           generic_types: vec!["T".to_string()],
           is_generic: true
-        })))
-      ))
+        })
+      })
     );
   }
 
@@ -1706,6 +1992,82 @@ mod tests {
     let mut interpreter = Interpreter::new(ast);
     interpreter.build().unwrap();
     assert_eq!(interpreter.duck_tables[0], vec![1]);
+    println!("{:?}", interpreter.build().unwrap()); // Visual check iguess (^_^)
+  }
+
+  #[test]
+  fn test_generic_identifier() {
+    let l = RefCell::new(0);
+    let l = move || {
+      l.replace_with(|l| *l + 1);
+      lexer::CodeLocation::new("".to_string(), *l.borrow())
+    };
+    let v = |s: &str| AST::Variable(s.to_string(), l());
+    /*
+      fn map_get:[K,V](map: map:[K,V], key: K): T {
+
+      }
+
+      fn test() {
+        let map = { x: 1, y: 2 }
+        let result = map_get:[string, int](map, "x")
+      }
+    */
+    let ast = AST::Block(
+      vec![
+        AST::Function(
+          "map_get".to_string(),
+          vec!["K".into(), "V".into()],
+          vec![
+            (
+              v("map"),
+              AST::GenericIdentifier(Box::new(v("map")), vec![v("K"), v("V")], l()),
+            ),
+            (v("key"), v("K")),
+          ],
+          Box::new(v("V")),
+          Box::new(AST::Block(vec![], l())),
+          l(),
+        ),
+        AST::Function(
+          "test".to_string(),
+          vec![],
+          vec![],
+          Box::new(AST::None(l())),
+          Box::new(AST::Block(
+            vec![
+              AST::Initialize(
+                AssignType::Let,
+                Box::new(v("map")),
+                Box::new(AST::MapLiteral(
+                  vec![
+                    (AST::StringLiteral("x".into(), l()), AST::IntLiteral(1, l())),
+                    (AST::StringLiteral("y".into(), l()), AST::IntLiteral(2, l())),
+                  ],
+                  l(),
+                )),
+                l(),
+              ),
+              AST::Call(
+                Box::new(AST::GenericIdentifier(
+                  Box::new(v("map_get")),
+                  vec![v("string"), v("int")],
+                  l(),
+                )),
+                vec![v("map"), AST::StringLiteral("x".into(), l())],
+                l(),
+              ),
+            ],
+            l(),
+          )),
+          l(),
+        ),
+      ],
+      l(),
+    );
+
+    let mut interpreter = Interpreter::new(ast);
+    interpreter.build().unwrap();
     println!("{:?}", interpreter.build().unwrap()); // Visual check iguess (^_^)
   }
 
