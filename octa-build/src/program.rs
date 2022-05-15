@@ -1,7 +1,12 @@
-use std::{collections::HashMap, vec};
+use std::{
+  collections::{HashMap, HashSet},
+  vec,
+};
 
 use octa_lex::lexer;
 use octa_parse::parser::{self, AssignType, BinOpType, UnOpType, AST};
+
+use crate::stack::Stack;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructField {
@@ -121,7 +126,7 @@ impl DataType {
       (DataType::Float, DataType::Float) => true,
       (DataType::Bool, DataType::Bool) => true,
       (DataType::String, DataType::String) => true,
-      (DataType::Struct { id: id1, ty: ty1 }, DataType::Struct { id: id2, ty: ty2 }) => {
+      (DataType::Struct { ty: ty1, .. }, DataType::Struct { ty: ty2, .. }) => {
         if ty1.special != ty2.special {
           return false;
         }
@@ -313,6 +318,12 @@ pub enum Statement {
   UnOp {
     op: UnOpType,
   },
+  CaptureClosure {
+    elements: usize,
+    label: usize,
+    reg: Register,
+  },
+  NilReg(Register),
   SetIntReg(i64, Register),
   SetFloatReg(f64, Register),
   SetBoolReg(bool, Register),
@@ -379,11 +390,8 @@ pub struct Interpreter {
   pub duck_table_index: HashMap<Vec<usize>, usize>,
   pub duck_tables: Vec<Vec<usize>>,
   pub label_count: usize,
-  pub stack_sizes: Vec<usize>,
+  pub stacks: Vec<Stack>,
   pub stack_functions: Vec<HashMap<String, (Function, usize)>>,
-  pub stack_offsets: Vec<Vec<HashMap<String, usize>>>,
-  pub data_types: Vec<Vec<HashMap<String, DataType>>>,
-  pub type_defs: Vec<Vec<HashMap<String, DataType>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -404,6 +412,7 @@ pub enum BuildError {
   TopLevelOperationExpected(lexer::CodeLocation),
   TopLevelBlockExpected(lexer::CodeLocation),
   FunctionError(FunctionCompleteErr, lexer::CodeLocation),
+  OutOfScopeAccess(lexer::CodeLocation),
 }
 
 pub fn as_name(ast: &AST, loc: lexer::CodeLocation) -> Result<String, BuildError> {
@@ -445,23 +454,21 @@ impl Interpreter {
       syntax,
       duck_table_index: HashMap::new(),
       duck_tables: Vec::new(),
+      stacks: vec![Stack::new()],
       stack_functions: vec![HashMap::new()],
-      stack_offsets: vec![vec![HashMap::new()]],
-      stack_sizes: vec![0],
-      data_types: vec![vec![HashMap::new()]],
-      type_defs: vec![vec![HashMap::new()]],
     };
-    interpreter.type_defs[0][0].insert("int".to_string(), DataType::Int);
-    interpreter.type_defs[0][0].insert("float".to_string(), DataType::Float);
-    interpreter.type_defs[0][0].insert("bool".to_string(), DataType::Bool);
-    interpreter.type_defs[0][0].insert("string".to_string(), DataType::String);
     let map = interpreter.build_map_type(
       &DataType::Generic { name: "K".into() },
       &DataType::Generic { name: "V".into() },
     );
-    interpreter.type_defs[0][0].insert("map".into(), map);
     let array = interpreter.build_array_type(&DataType::Generic { name: "T".into() });
-    interpreter.type_defs[0][0].insert("array".to_string(), array);
+    let stack = &mut interpreter.stacks[0];
+    stack.set_typedef("int".to_string(), DataType::Int);
+    stack.set_typedef("float".into(), DataType::Float);
+    stack.set_typedef("bool".into(), DataType::Bool);
+    stack.set_typedef("string".into(), DataType::String);
+    stack.set_typedef("map".into(), map);
+    stack.set_typedef("array".into(), array);
     interpreter
   }
 
@@ -545,36 +552,32 @@ impl Interpreter {
   }
 
   pub fn get_visible_scopes(&self) -> &Vec<HashMap<String, DataType>> {
-    &self.data_types[self.stack_sizes.len() - 1]
+    &self.stacks.last().unwrap().data_types
   }
 
   pub fn get_current_scope(&self) -> &HashMap<String, DataType> {
     let scopes = self.get_visible_scopes();
-    &scopes[scopes.len() - 1]
+    &scopes.last().unwrap()
   }
 
   pub fn get_visible_offsets(&self) -> &Vec<HashMap<String, usize>> {
-    &self.stack_offsets[self.stack_sizes.len() - 1]
+    &self.stacks.last().unwrap().offsets
   }
 
   pub fn type_by_name(&self, name: &String) -> Option<DataType> {
     // TODO: Capture variable
-    for types in self.data_types.iter().rev() {
-      for scope in types.iter().rev() {
-        if let Some(ty) = scope.get(name) {
-          return Some(ty.clone());
-        }
+    for stack in self.stacks.iter().rev() {
+      if let Some(ty) = stack.type_by_name(name) {
+        return Some(ty.clone());
       }
     }
     None
   }
 
   pub fn typedef_by_name(&self, name: &String) -> Option<DataType> {
-    for types in self.type_defs.iter().rev() {
-      for scope in types.iter().rev() {
-        if let Some(ty) = scope.get(name) {
-          return Some(ty.clone());
-        }
+    for stacks in self.stacks.iter().rev() {
+      if let Some(ty) = stacks.typedef_by_name(name) {
+        return Some(ty.clone());
       }
     }
     None
@@ -582,12 +585,10 @@ impl Interpreter {
 
   pub fn set_typedef(&mut self, name: &String, ty: DataType) {
     self
-      .type_defs
+      .stacks
       .last_mut()
       .unwrap()
-      .last_mut()
-      .unwrap()
-      .insert(name.clone(), ty);
+      .set_typedef(name.clone(), ty);
   }
 
   fn create_label(&mut self) -> usize {
@@ -595,10 +596,23 @@ impl Interpreter {
     self.label_count
   }
 
-  pub fn offset_by_name(&self, name: &String) -> Option<usize> {
+  pub fn offset_by_name(&mut self, name: &String) -> Option<usize> {
     for scope in self.get_visible_offsets().iter().rev() {
       if let Some(offset) = scope.get(name) {
         return Some(*offset);
+      }
+    }
+    let stacks_max = self.stacks.len() - 1;
+    for (dirty, scope) in self.stacks.iter().rev().skip(1).enumerate() {
+      if let Some(offset) = scope.offset_by_name(name) {
+        let mut to = self.stacks[stacks_max - dirty].increase_stack_size();
+        let mut from = offset;
+        for next_stack in (stacks_max - dirty)..self.stacks.len() {
+          self.stacks[next_stack].mark_dirty(from, to);
+          from = to;
+          to = self.stacks[next_stack].increase_stack_size();
+        }
+        return Some(to);
       }
     }
     None
@@ -914,61 +928,37 @@ impl Interpreter {
     return Ok(program);
   }
 
-  fn set_data_offset(&mut self, name: &str, offset: usize) {
-    let last = self.stack_offsets.len() - 1;
-    let last_scope = &mut self.stack_offsets[last];
-    last_scope
-      .last_mut()
-      .unwrap()
-      .insert(name.to_string(), offset);
-  }
-
-  fn get_stack_size(&self) -> usize {
-    return self.stack_sizes[self.stack_offsets.len() - 1];
-  }
-
   fn inc_stack_size(&mut self) -> usize {
-    let last = self.stack_offsets.len() - 1;
-    self.stack_sizes[last] += 1;
-    self.stack_sizes[last] - 1
+    self.stacks.last_mut().unwrap().increase_stack_size()
   }
 
-  fn pop_stack(&mut self) {
-    self.stack_offsets.pop();
-    self.stack_sizes.pop();
-    self.data_types.pop();
+  fn pop_stack(&mut self, loc: lexer::CodeLocation) -> Result<(), BuildError> {
+    let stack = self.stacks.pop().unwrap();
+    if stack.dirty_access.len() != 0 {
+      return Err(BuildError::OutOfScopeAccess(loc.clone()));
+    }
+    Ok(())
+  }
+
+  fn pop_dirty_stack(&mut self) -> HashSet<(usize, usize)> {
+    let stack = self.stacks.pop().unwrap();
+    stack.dirty_access
   }
 
   fn pop_scope(&mut self) {
-    let last = self.stack_sizes.len() - 1;
-    self.stack_sizes[last] -= self.stack_offsets.last_mut().unwrap().pop().unwrap().len();
-    self.data_types.last_mut().unwrap().pop();
+    self.stacks.last_mut().unwrap().pop_scope();
   }
 
   fn add_stack(&mut self) {
-    self.stack_offsets.push(vec![HashMap::new()]);
-    self.stack_sizes.push(0);
-    self.data_types.push(vec![HashMap::new()]);
+    self.stacks.push(Stack::new());
   }
 
   fn add_scope(&mut self) {
-    self.stack_offsets.last_mut().unwrap().push(HashMap::new());
-    self.data_types.last_mut().unwrap().push(HashMap::new());
+    self.stacks.last_mut().unwrap().push_scope();
   }
 
   fn stack_add(&mut self, name: &str) -> usize {
-    let last = self.stack_offsets.len() - 1;
-    let last_scope = &self.stack_offsets[last];
-    let scope = last_scope.last().unwrap();
-    if scope.contains_key(&name.to_string()) {
-      return scope[&name.to_string()];
-    }
-    let offset = self.inc_stack_size();
-    self.stack_offsets[last]
-      .last_mut()
-      .unwrap()
-      .insert(name.to_string(), offset);
-    offset
+    self.stacks.last_mut().unwrap().add_var(name.into())
   }
 
   fn stack_add_function(&mut self, name: &str, other: Function) -> Result<(), BuildError> {
@@ -987,11 +977,11 @@ impl Interpreter {
   }
 
   fn set_data_type(&mut self, name: &String, ty: DataType) {
-    let last = self.data_types.len() - 1;
-    self.data_types[last]
+    self
+      .stacks
       .last_mut()
       .unwrap()
-      .insert(name.clone(), ty);
+      .set_datatype(name.clone(), ty);
   }
 
   fn get_fn_label(&self, callee: &AST) -> Result<usize, BuildError> {
@@ -1045,6 +1035,8 @@ impl Interpreter {
       AST::BinOp(lhs, op, rhs, _) => self.build_bin_op(lhs, op.clone(), rhs, reg),
       AST::GenericIdentifier(..) => self.build_generic_identifier_to_reg(value, reg),
       AST::MapLiteral(..) => self.build_map_literal_to_reg(value, reg),
+      AST::Nil(..) => Ok((vec![Statement::NilReg(reg)], DataType::None)),
+      AST::Closure(..) => self.build_closure_to_reg(value, reg),
       _ => todo!(),
     }
   }
@@ -1353,8 +1345,7 @@ impl Interpreter {
     let functions = self.stack_functions.last().unwrap().clone();
     let functions = functions.values();
     for (function, label) in functions {
-      program.push(Statement::Label { name: *label });
-      program.append(&mut self.build_patterned_function(function)?);
+      program.append(&mut self.build_patterned_function(function, *label)?);
     }
     self.stack_functions.pop();
     return Ok(program);
@@ -1368,14 +1359,22 @@ impl Interpreter {
     }
   }
 
-  fn build_patterned_function(&mut self, func: &Function) -> Result<Program, BuildError> {
+  fn build_patterned_function(
+    &mut self,
+    func: &Function,
+    label: usize,
+  ) -> Result<Program, BuildError> {
     if !func.is_complete() {
       return Err(BuildError::FunctionError(
         FunctionCompleteErr::NoCompleteFunction,
         func.ast.location(),
       ));
     }
-    let mut program = vec![];
+    let fn_guard = self.create_label();
+    let mut program = vec![
+      Statement::Jmp { label: fn_guard },
+      Statement::Label { name: label },
+    ];
     if let AST::Function(name, generics, args, ret, body, loc) = &func.ast {
       self.add_stack();
       self.add_generic_scope(&generics);
@@ -1410,8 +1409,11 @@ impl Interpreter {
         }
       }
       self.pop_scope();
-      self.pop_stack();
+      self.pop_stack(func.ast.location())?;
     }
+    program.push(Statement::NilReg(REG_RETURN));
+    program.push(Statement::Ret);
+    program.push(Statement::Label { name: fn_guard });
     Ok(program)
   }
 
@@ -1432,7 +1434,73 @@ impl Interpreter {
           todo!();
         }
       }
-      _ => todo!("build_fn ast is not a function"),
+      _ => panic!("build_fn ast is not a function"),
+    }
+  }
+
+  fn build_closure_to_reg(
+    &mut self,
+    ast: &AST,
+    reg: Register,
+  ) -> Result<(Program, DataType), BuildError> {
+    match ast {
+      AST::Closure(generic, args, ret, body, loc) => {
+        let ty = self.build_fn_def("".into(), generic, args, ret, body, loc.clone())?;
+        let mut program = vec![];
+        let mut capture = vec![];
+        let skip = self.create_label();
+        let fn_label = self.create_label();
+        program.push(Statement::Jmp { label: skip });
+        program.push(Statement::Label { name: fn_label });
+        self.add_stack();
+        self.add_generic_scope(&generic);
+        for (i, arg) in args.iter().enumerate() {
+          if let AST::Variable(id, ..) = &arg.0 {
+            let arg_ty = self.resolve_typedef(&arg.1)?;
+            self.set_data_type(&id, arg_ty);
+            self.stack_add(&id);
+          } else {
+            return Err(BuildError::ParameterTypeMismatch(
+              DataType::None,
+              DataType::Unresolved,
+              arg.1.location(),
+            ));
+          }
+          program.push(Statement::Push { reg: i as u8 });
+        }
+        let mut body = &mut self.build_statement(body)?;
+        self.pop_scope();
+        let dirty = self.pop_dirty_stack();
+        let mut dirty = dirty.iter().collect::<Vec<_>>();
+        dirty.sort_by(|a, b| a.1.cmp(&b.1));
+        for (from, _) in &dirty {
+          capture.push(Statement::CopyToReg {
+            reg: REG_A,
+            offset: *from,
+          });
+          capture.push(Statement::Push { reg: REG_A });
+        }
+
+        for (reg_off, (_, to)) in dirty.iter().enumerate() {
+          program.push(Statement::CopyFromReg {
+            reg: (args.len() + reg_off) as u8,
+            offset: *to,
+          })
+        }
+        program.append(&mut body);
+        program.push(Statement::NilReg(REG_RETURN));
+        program.push(Statement::Ret);
+        program.push(Statement::Label { name: skip });
+        program.append(&mut capture);
+        program.push(Statement::CaptureClosure {
+          elements: dirty.len(),
+          label: fn_label,
+          reg,
+        });
+        program.push(Statement::StackDec { size: dirty.len() });
+        Ok((program, ty))
+      }
+      _ => panic!("build_closure_to_reg ast is not a closure"),
     }
   }
 
@@ -1689,7 +1757,7 @@ impl Interpreter {
     if !generic.is_empty() {
       self.pop_scope(); // pop generic resolved scope
     }
-    self.pop_stack();
+    self.pop_stack(loc)?;
     Ok(DataType::Function {
       ty: Box::new(FunctionDataType {
         name,
@@ -2122,6 +2190,53 @@ mod tests {
       l(),
     );
 
+    let mut interpreter = Interpreter::new(ast);
+    println!("{:?}", interpreter.build().unwrap()); // Visual check iguess (^_^)
+  }
+
+  #[test]
+  fn test_build_closure() {
+    let l = || lexer::CodeLocation::new("".to_string(), 0);
+    let v = |s: &str| AST::Variable(s.to_string(), l());
+    /*
+      fn test() {
+        let a = 1;
+        let b = fn (): int { return a; }
+      }
+    */
+    let ast = AST::Block(
+      vec![AST::Function(
+        "test".to_string(),
+        vec![],
+        vec![],
+        Box::new(AST::None(l())),
+        Box::new(AST::Block(
+          vec![
+            AST::Initialize(
+              AssignType::Let,
+              Box::new(v("a")),
+              Box::new(AST::IntLiteral(1, l())),
+              l(),
+            ),
+            AST::Initialize(
+              AssignType::Let,
+              Box::new(v("b")),
+              Box::new(AST::Closure(
+                vec![],
+                vec![],
+                Box::new(v("int")),
+                Box::new(AST::Return(Some(Box::new(v("a"))), l())),
+                l(),
+              )),
+              l(),
+            ),
+          ],
+          l(),
+        )),
+        l(),
+      )],
+      l(),
+    );
     let mut interpreter = Interpreter::new(ast);
     println!("{:?}", interpreter.build().unwrap()); // Visual check iguess (^_^)
   }

@@ -75,12 +75,20 @@ pub enum AST {
     Box<AST>,
     lexer::CodeLocation,
   ),
+  Closure(
+    Vec<String>,
+    Vec<(AST, AST)>,
+    Box<AST>,
+    Box<AST>,
+    lexer::CodeLocation,
+  ),
   FunctionDefinition(Vec<String>, Vec<(AST, AST)>, Box<AST>, lexer::CodeLocation),
   MemberAccess(Box<AST>, String, lexer::CodeLocation),
   IndexAccess(Box<AST>, Box<AST>, lexer::CodeLocation),
   If(Box<AST>, Box<AST>, Option<Box<AST>>, lexer::CodeLocation),
   Return(Option<Box<AST>>, lexer::CodeLocation),
   GenericIdentifier(Box<AST>, Vec<AST>, lexer::CodeLocation), // Func[asd,asd,asd]
+  Nil(lexer::CodeLocation),
 }
 
 impl AST {
@@ -109,6 +117,8 @@ impl AST {
       AST::Return(.., loc) => loc,
       AST::GenericIdentifier(.., loc) => loc,
       AST::FunctionDefinition(.., loc) => loc,
+      AST::Closure(.., loc) => loc,
+      AST::Nil(loc) => loc,
     }
     .clone()
   }
@@ -160,7 +170,8 @@ impl AST {
       | AST::BoolLiteral(..)
       | AST::MapLiteral(..)
       | AST::ArrayLiteral(..)
-      | AST::StringLiteral(..) => true,
+      | AST::StringLiteral(..)
+      | AST::Nil(..) => true,
       _ => false,
     }
   }
@@ -278,6 +289,7 @@ impl Parser {
         let args = self.parse_map()?;
         self.parse_extension(AST::MapLiteral(args, loc))
       }
+      lexer::Token::Keyword(Keyword::Fn) => self.parse_function(false, loc),
       _ => Err(AstError::UnexpectedToken(token, loc)),
     }
   }
@@ -554,7 +566,7 @@ impl Parser {
           Keyword::Const | Keyword::Let => self.parse_initialization(keyword.clone()),
           Keyword::If => self.parse_if(),
           Keyword::Return => self.parse_return(),
-          Keyword::Fn => self.parse_function(loc),
+          Keyword::Fn => self.parse_function(false, loc),
           _ => return Err(AstError::UnexpectedToken(token.clone(), loc.clone())),
         }
       }
@@ -621,6 +633,7 @@ impl Parser {
         };
         return self.parse_extension(ident);
       }
+      lexer::Token::Keyword(Keyword::Fn) => self.parse_function(true, loc),
       _ => Err(AstError::IdentifierExpected(loc.clone())),
     }
   }
@@ -658,10 +671,11 @@ impl Parser {
   // fn foo[T,V](a: T): V {}
   //
   // fn Type foo[T, V](a: T): V {}
-  pub fn parse_function(&mut self, fn_loc: lexer::CodeLocation) -> Result<AST, AstError> {
-    let (token, loc) = self.dequeue()?;
+  pub fn parse_function(&mut self, ty: bool, fn_loc: lexer::CodeLocation) -> Result<AST, AstError> {
+    let (token, loc) = self.peek()?;
     let mut name = String::new();
     if let lexer::Token::Identifier(id) = token {
+      self.dequeue()?;
       name = id.clone();
     }
     let (token, loc) = self.peek()?;
@@ -700,11 +714,21 @@ impl Parser {
       _ => AST::None(loc.clone()),
     };
 
-    if name == "".to_string() {
+    if ty {
       return Ok(AST::FunctionDefinition(
         generics,
         params,
         Box::new(return_type),
+        fn_loc,
+      ));
+    }
+
+    if name == "".to_string() {
+      return Ok(AST::Closure(
+        generics,
+        params,
+        Box::new(return_type),
+        Box::new(self.parse_full_body(fn_loc.clone())?),
         fn_loc,
       ));
     }
@@ -1150,6 +1174,45 @@ mod tests {
         )],
         Box::new(AST::Variable("int".to_string(), l())),
         Box::new(AST::Block(vec![], l(),)),
+        l()
+      ))
+    );
+  }
+
+  #[test]
+  fn test_parse_closure() {
+    let l = || CodeLocation::new("base".to_string(), 0);
+    let tokens = vec![
+      (Token::Keyword(Keyword::Let), l()),
+      (Token::Identifier("x".to_string()), l()),
+      (Token::Operator(OpType::Eq), l()),
+      (Token::Keyword(Keyword::Fn), l()),
+      (Token::Operator(OpType::LParen), l()),
+      (Token::Identifier("a".to_string()), l()),
+      (Token::Operator(OpType::Colon), l()),
+      (Token::Identifier("int".to_string()), l()),
+      (Token::Operator(OpType::RParen), l()),
+      (Token::Operator(OpType::Colon), l()),
+      (Token::Identifier("int".to_string()), l()),
+      (Token::Operator(OpType::LBrace), l()),
+      (Token::Operator(OpType::RBrace), l()),
+    ];
+    let ast = Parser::new(tokens).parse();
+    assert_eq!(
+      ast,
+      Ok(AST::Initialize(
+        AssignType::Let,
+        Box::new(AST::Variable("x".into(), l())),
+        Box::new(AST::Closure(
+          vec![],
+          vec![(
+            AST::Variable("a".to_string(), l()),
+            AST::Variable("int".to_string(), l())
+          )],
+          Box::new(AST::Variable("int".to_string(), l())),
+          Box::new(AST::Block(vec![], l(),)),
+          l()
+        )),
         l()
       ))
     );

@@ -42,6 +42,7 @@ pub enum Keyword {
   Const,
   Type,
   Return,
+  Nil,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +79,7 @@ fn as_keyword(id: String) -> Option<Keyword> {
     "const" => Some(Keyword::Const),
     "return" => Some(Keyword::Return),
     "type" => Some(Keyword::Type),
+    "nil" => Some(Keyword::Nil),
     _ => None,
   }
 }
