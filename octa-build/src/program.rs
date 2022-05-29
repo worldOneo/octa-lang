@@ -297,7 +297,7 @@ pub enum Statement {
     label: usize,
   },
   Call {
-    label: usize,
+    reg: Register,
   },
   Ret,
   Push {
@@ -984,18 +984,43 @@ impl Interpreter {
       .set_datatype(name.clone(), ty);
   }
 
-  fn get_fn_label(&self, callee: &AST) -> Result<usize, BuildError> {
+  fn build_fn_to_reg(
+    &mut self,
+    callee: &AST,
+    reg: Register,
+  ) -> Result<(Program, DataType), BuildError> {
     match callee {
       AST::Variable(name, _) => {
         for stack in self.stack_functions.iter().rev() {
-          if let Some((_, label)) = stack.get(name) {
-            return Ok(*label);
+          if let Some((func, label)) = stack.get(name) {
+            return Ok((
+              vec![Statement::CaptureClosure {
+                elements: 0,
+                label: *label,
+                reg: reg,
+              }],
+              DataType::Function {
+                ty: Box::new(func.data_type.clone()),
+              },
+            ));
           }
         }
         Err(BuildError::InvalidCall(callee.location()))
       }
-      AST::GenericIdentifier(ast, ..) => self.get_fn_label(ast),
-      _ => Err(BuildError::InvalidCall(callee.location())),
+      AST::GenericIdentifier(..) => {
+        let (prog, ty) = self.build_generic_identifier_to_reg(callee, reg)?;
+        if let DataType::Function { .. } = ty {
+          return Ok((prog, ty));
+        }
+        Err(BuildError::InvalidCall(callee.location()))
+      }
+      _ => {
+        if let AST::Closure(..) = callee {
+          let (program, ty) = self.build_closure_to_reg(callee, reg)?;
+          return Ok((program, ty));
+        }
+        Err(BuildError::InvalidCall(callee.location()))
+      }
     }
   }
 
@@ -1025,6 +1050,18 @@ impl Interpreter {
           if let Some(offset) = self.offset_by_name(name) {
             return Ok((vec![Statement::CopyToReg { offset, reg }], vty.clone()));
           } else {
+            if let Some((f, usize)) = self.stack_function(name) {
+              return Ok((
+                vec![Statement::CaptureClosure {
+                  elements: 0,
+                  label: usize,
+                  reg,
+                }],
+                DataType::Function {
+                  ty: Box::new(f.data_type.clone()),
+                },
+              ));
+            }
             return Err(BuildError::InvalidType(value.location()));
           }
         } else {
@@ -1110,7 +1147,8 @@ impl Interpreter {
         ));
       }
       let mut program = vec![];
-      let label = self.get_fn_label(&callee)?;
+      let label = self.build_fn_to_reg(&callee, REG_A)?;
+      program.push(Statement::Pop { reg: REG_A });
       for i in 0..args.len() {
         let arg = &args[i];
         let (mut p, t) = self.build_value_to_reg(arg, i as Register)?;
@@ -1129,7 +1167,8 @@ impl Interpreter {
           reg: (args.len() - i - 1) as Register,
         });
       }
-      program.push(Statement::Call { label });
+      program.push(Statement::Pop { reg: REG_A });
+      program.push(Statement::Call { reg: REG_A });
       return Ok((program, func.ret));
     }
     return Err(BuildError::InvalidType(callee.location()));
@@ -1702,6 +1741,15 @@ impl Interpreter {
     } else {
       self.resolve_typedef(rhs)
     }
+  }
+
+  pub fn stack_function(&self, name: &String) -> Option<(Function, usize)> {
+    for func in self.stack_functions.iter().rev() {
+      if func.contains_key(name) {
+        return Some(func[name].clone());
+      }
+    }
+    None
   }
 
   pub fn build_fn_def(
