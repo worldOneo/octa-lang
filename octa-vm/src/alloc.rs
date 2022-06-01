@@ -33,6 +33,7 @@ impl Visitor {
           self.visit(value, gc);
         }
       }
+      Value::Map(ref map) => map.visit(self, gc),
     }
   }
 
@@ -126,7 +127,8 @@ impl GC {
     self.sweep_unmarked_nodes(&visitor);
   }
 
-  pub fn alloc_array(&mut self) -> Value { // TODO: list vs array for alloc/mod performance Q?
+  pub fn alloc_array(&mut self) -> Value {
+    // TODO: list vs array for alloc/mod performance Q?
     self.alloc_reference(Value::Array(Box::new(Array::new())))
   }
 }

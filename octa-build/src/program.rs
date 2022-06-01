@@ -6,7 +6,7 @@ use std::{
 use octa_lex::lexer;
 use octa_parse::parser::{self, AssignType, BinOpType, UnOpType, AST};
 
-use crate::stack::Stack;
+use crate::{optimizer::Optimizer, stack::Stack};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructField {
@@ -923,8 +923,9 @@ impl Interpreter {
 
   pub fn build(&mut self) -> Result<Program, BuildError> {
     let syntax = &self.syntax.clone();
-    let mut program = vec![];
-    program.append(&mut self.build_statement(syntax)?);
+    let program = self.build_statement(syntax)?;
+    let optimizer = Optimizer::new(program);
+    let program = optimizer.optimize();
     return Ok(program);
   }
 
@@ -1147,7 +1148,7 @@ impl Interpreter {
         ));
       }
       let mut program = vec![];
-      let label = self.build_fn_to_reg(&callee, REG_A)?;
+      self.build_fn_to_reg(&callee, REG_A)?;
       program.push(Statement::Pop { reg: REG_A });
       for i in 0..args.len() {
         let arg = &args[i];
