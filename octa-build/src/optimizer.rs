@@ -42,11 +42,14 @@ impl Optimizer {
       .map(|(_, s)| s.clone())
       .collect();
     for inst in program.iter() {
-      if let Statement::Label { name } = inst {
-        jumps.insert(name.clone(), i);
-      } else {
-        i += 1;
-      }
+      match inst {
+        Statement::Label { name } => {
+          jumps.insert(*name, i);
+        }
+        _ => {
+          i += 1;
+        }
+      };
     }
     let mut lableless = vec![];
     for inst in program.iter() {
@@ -54,6 +57,19 @@ impl Optimizer {
         Statement::Jmp { label } => {
           if let Some(i) = jumps.get(label) {
             lableless.push(Statement::Jmp { label: *i });
+          }
+        }
+        Statement::CaptureClosure {
+          elements,
+          label,
+          reg,
+        } => {
+          if let Some(i) = jumps.get(label) {
+            lableless.push(Statement::CaptureClosure {
+              elements: *elements,
+              label: *i,
+              reg: *reg,
+            });
           }
         }
         Statement::Label { .. } => {}

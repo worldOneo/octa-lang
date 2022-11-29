@@ -30,4 +30,5 @@ name = "octa-vm"
 version = "0.1.0"
 dependencies = [
  "octa-build",
+ "octa-parse",
 ]

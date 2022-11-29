@@ -303,7 +303,6 @@ pub enum Statement {
   Push {
     reg: Register,
   },
-  Swap,
   Dupe {
     reg: Register,
     val: Register,
@@ -311,7 +310,6 @@ pub enum Statement {
   Pop {
     reg: Register,
   },
-  Copy,
   Op {
     op: BinOpType,
   },
@@ -377,10 +375,9 @@ pub enum Statement {
     size: usize,
   },
 }
-const REG_A: Register = 0;
-const REG_B: Register = 1;
-const REG_C: Register = 2;
-const REG_RETURN: Register = 255;
+pub const REG_A: Register = 0;
+pub const REG_B: Register = 1;
+pub const REG_RETURN: Register = 128;
 
 pub type Program = Vec<Statement>;
 
@@ -1148,8 +1145,8 @@ impl Interpreter {
         ));
       }
       let mut program = vec![];
-      self.build_fn_to_reg(&callee, REG_A)?;
-      program.push(Statement::Pop { reg: REG_A });
+      program.append(&mut self.build_fn_to_reg(&callee, REG_A)?.0);
+      program.push(Statement::Push { reg: REG_A });
       for i in 0..args.len() {
         let arg = &args[i];
         let (mut p, t) = self.build_value_to_reg(arg, i as Register)?;
@@ -1168,8 +1165,12 @@ impl Interpreter {
           reg: (args.len() - i - 1) as Register,
         });
       }
-      program.push(Statement::Pop { reg: REG_A });
-      program.push(Statement::Call { reg: REG_A });
+      program.push(Statement::Pop {
+        reg: args.len() as Register,
+      });
+      program.push(Statement::Call {
+        reg: args.len() as Register,
+      });
       return Ok((program, func.ret));
     }
     return Err(BuildError::InvalidType(callee.location()));
@@ -1981,6 +1982,7 @@ mod tests {
     let l = || lexer::CodeLocation::new("".to_string(), 0);
     let v = |s: &str| AST::Variable(s.to_string(), l());
     /*
+     e(1, 2)
      fn e(a: int, b: int) {
       let c = a + b
       let d = c + 1
@@ -1988,6 +1990,7 @@ mod tests {
      }
     */
     let ast = AST::Block(vec![
+      AST::Call(Box::new(AST::Variable("e".into(), l())), vec![AST::IntLiteral(1, l()), AST::IntLiteral(2, l())], l()),
       AST::Function("e".to_string(), vec![], vec![(v("a"), v("int")), (v("b"), v("int"))],
                 Box::new(v("int")), Box::new(AST::Block(vec![
                   AST::Initialize(
@@ -2248,42 +2251,46 @@ mod tests {
     let l = || lexer::CodeLocation::new("".to_string(), 0);
     let v = |s: &str| AST::Variable(s.to_string(), l());
     /*
-      fn test() {
-        let a = 1;
-        let b = fn (): int { return a; }
-      }
+    test()
+    fn test() {
+      let a = 1;
+      let b = fn (): int { return a; }
+    }
     */
     let ast = AST::Block(
-      vec![AST::Function(
-        "test".to_string(),
-        vec![],
-        vec![],
-        Box::new(AST::None(l())),
-        Box::new(AST::Block(
-          vec![
-            AST::Initialize(
-              AssignType::Let,
-              Box::new(v("a")),
-              Box::new(AST::IntLiteral(1, l())),
-              l(),
-            ),
-            AST::Initialize(
-              AssignType::Let,
-              Box::new(v("b")),
-              Box::new(AST::Closure(
-                vec![],
-                vec![],
-                Box::new(v("int")),
-                Box::new(AST::Return(Some(Box::new(v("a"))), l())),
+      vec![
+        AST::Call(Box::new(AST::Variable("test".into(), l())), vec![], l()),
+        AST::Function(
+          "test".to_string(),
+          vec![],
+          vec![],
+          Box::new(AST::None(l())),
+          Box::new(AST::Block(
+            vec![
+              AST::Initialize(
+                AssignType::Let,
+                Box::new(v("a")),
+                Box::new(AST::IntLiteral(1, l())),
                 l(),
-              )),
-              l(),
-            ),
-          ],
+              ),
+              AST::Initialize(
+                AssignType::Let,
+                Box::new(v("b")),
+                Box::new(AST::Closure(
+                  vec![],
+                  vec![],
+                  Box::new(v("int")),
+                  Box::new(AST::Return(Some(Box::new(v("a"))), l())),
+                  l(),
+                )),
+                l(),
+              ),
+            ],
+            l(),
+          )),
           l(),
-        )),
-        l(),
-      )],
+        ),
+      ],
       l(),
     );
     let mut interpreter = Interpreter::new(ast);

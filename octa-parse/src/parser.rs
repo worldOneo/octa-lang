@@ -43,7 +43,7 @@ impl BinOpType {
   }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UnOpType {
   Neg,
   Not,

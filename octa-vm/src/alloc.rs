@@ -22,7 +22,7 @@ impl Visitor {
 
   pub fn visit(&mut self, value: &Value, gc: &GC) {
     match value {
-      Value::Int(_) | Value::Bool(_) | Value::Float(_) | Value::String(_) => {}
+      Value::Int(_) | Value::Bool(_) | Value::Float(_) | Value::String(_) | Value::Nil => {}
       Value::Ref(ref ref_) => {
         if self.visited.insert(ref_.value) {
           self.visit(&gc.get_value(ref_.value), gc);
@@ -34,6 +34,9 @@ impl Visitor {
         }
       }
       Value::Map(ref map) => map.visit(self, gc),
+      Value::Fn(_fn) => {
+        _fn.captured.iter().for_each(|f| self.visit(f, gc));
+      }
     }
   }
 

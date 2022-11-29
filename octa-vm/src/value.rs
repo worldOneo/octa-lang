@@ -14,6 +14,12 @@ pub struct Array {
   pub values: Vec<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Closure {
+  pub captured: Vec<Value>,
+  pub location: usize,
+}
+
 
 pub const HASH_ITER_PRIME: u64 = 31;
 
@@ -34,6 +40,7 @@ impl Array {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+  Nil,
   Int(i64),
   Bool(bool),
   Float(f64),
@@ -41,6 +48,7 @@ pub enum Value {
   Ref(Box<Ref>),
   Array(Box<Array>),
   Map(Box<Map>),
+  Fn(Box<Closure>),
 }
 
 const FNV64A_BASIS: u64 = 14695981039346656037;
@@ -71,6 +79,7 @@ impl Value {
       Value::Ref(r) => gc.get_value(r.value.clone()).hash(gc),
       Value::Array(a) => a.hash(gc),
       Value::Map(m) => m.hash(gc),
+      Value::Nil | Value::Fn(..) => 0,
     }
   }
 }
